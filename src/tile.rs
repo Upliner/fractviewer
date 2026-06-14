@@ -75,7 +75,7 @@ impl TileCoord {
 
     /// Complex-plane units per pixel for this tile.
     pub fn pixel_scale(&self) -> f64 {
-        self.tile_extent() / TILE_SIZE as f64
+        self.tile_extent() / (TILE_SIZE - 1) as f64
     }
 
     /// Does this tile's region overlap the given viewport?
@@ -104,7 +104,8 @@ impl TileSlot {
         let inv = 1.0 / ATLAS_TILES_PER_SIDE as f32;
         let u0 = self.slot_x as f32 * inv;
         let v0 = self.slot_y as f32 * inv;
-        [u0, v0, u0 + inv, v0 + inv]
+        let inv_2 = inv / (TILE_SIZE * 2) as f32;
+        [u0 + inv_2, v0 + inv_2, u0 + inv - inv_2, v0 + inv - inv_2]
     }
 }
 
@@ -120,7 +121,7 @@ impl TileAtlas {
             memory_allocator.clone(),
             ImageCreateInfo {
                 image_type: ImageType::Dim2d,
-                format: Format::R16_UINT,
+                format: Format::R16_UNORM,
                 extent: [ATLAS_SIZE, ATLAS_SIZE, 1],
                 usage: ImageUsage::STORAGE | ImageUsage::SAMPLED,
                 ..Default::default()

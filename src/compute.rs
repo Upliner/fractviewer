@@ -21,39 +21,27 @@ mod mandelbrot_shader {
         src: r"
 #version 460
 
-layout(local_size_x = 16, local_size_y = 16) in;
+layout(local_size_x = 32, local_size_y = 32) in;
 
-layout(set = 0, binding = 0, r16ui) uniform writeonly uimage2D atlas;
+layout(set = 0, binding = 0) uniform writeonly image2D atlas;
 
 layout(push_constant) uniform PushConstants {
-    // Each f64 encoded as two uint32 (lo, hi) to avoid alignment issues
-    uint origin_x_lo;
-    uint origin_x_hi;
-    uint origin_y_lo;
-    uint origin_y_hi;
-    uint scale_lo;
-    uint scale_hi;
+    double origin_x;
+    double origin_y;
+    double pixel_scale;
     int atlas_offset_x;
     int atlas_offset_y;
     uint max_iterations;
+    uint padding;
 };
-
-double decode_double(uint lo, uint hi) {
-    return packDouble2x32(uvec2(lo, hi));
-}
 
 void main() {
     ivec2 local_pos = ivec2(gl_GlobalInvocationID.xy);
-    if (local_pos.x >= 256 || local_pos.y >= 256) return;
 
     ivec2 atlas_pos = local_pos + ivec2(atlas_offset_x, atlas_offset_y);
 
-    double tile_origin_x = decode_double(origin_x_lo, origin_x_hi);
-    double tile_origin_y = decode_double(origin_y_lo, origin_y_hi);
-    double pixel_scale = decode_double(scale_lo, scale_hi);
-
-    double cr = tile_origin_x + double(local_pos.x) * pixel_scale;
-    double ci = tile_origin_y + double(local_pos.y) * pixel_scale;
+    double cr = origin_x + double(local_pos.x) * pixel_scale;
+    double ci = origin_y + double(local_pos.y) * pixel_scale;
 
     double zr = 0.0;
     double zi = 0.0;
@@ -67,7 +55,7 @@ void main() {
         zr = zr2 - zi2 + cr;
     }
 
-    imageStore(atlas, atlas_pos, uvec4(iter, 0, 0, 0));
+    imageStore(atlas, atlas_pos, vec4(float(iter) / float(max_iterations), 0.0, 0.0, 0.0));
 }
 "
     }
@@ -132,23 +120,16 @@ impl ComputeEngine {
             .unwrap();
 
             let (ox, oy) = coord.origin();
-            let ps = coord.pixel_scale();
             let (atlas_ox, atlas_oy) = slot.pixel_offset();
 
-            let ox_bits = ox.to_bits();
-            let oy_bits = oy.to_bits();
-            let ps_bits = ps.to_bits();
-
             let push = mandelbrot_shader::PushConstants {
-                origin_x_lo: ox_bits as u32,
-                origin_x_hi: (ox_bits >> 32) as u32,
-                origin_y_lo: oy_bits as u32,
-                origin_y_hi: (oy_bits >> 32) as u32,
-                scale_lo: ps_bits as u32,
-                scale_hi: (ps_bits >> 32) as u32,
+                origin_x: ox,
+                origin_y: oy,
+                pixel_scale: coord.pixel_scale(),
                 atlas_offset_x: atlas_ox as i32,
                 atlas_offset_y: atlas_oy as i32,
                 max_iterations: self.max_iterations,
+                padding: 0,
             };
 
             builder
@@ -165,7 +146,7 @@ impl ComputeEngine {
                 .unwrap();
             unsafe {
                 builder
-                    .dispatch([TILE_SIZE / 16, TILE_SIZE / 16, 1])
+                    .dispatch([TILE_SIZE / 32, TILE_SIZE / 32, 1])
                     .unwrap();
             }
         }

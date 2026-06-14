@@ -24,7 +24,7 @@ use render::Renderer;
 use tile::QuadTree;
 
 const MAX_ITERATIONS: u32 = 8192;
-const MAX_COMPUTE_PER_FRAME: usize = 16;
+const MAX_COMPUTE_PER_FRAME: usize = 1;
 
 struct App {
     window: Option<Arc<Window>>,
@@ -168,7 +168,6 @@ impl ApplicationHandler for App {
             &ctx.device,
             ctx.subpass(),
             &ctx.memory_allocator,
-            MAX_ITERATIONS,
         );
         let quadtree = QuadTree::new(ctx.memory_allocator.clone());
 
@@ -258,8 +257,8 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
-    let event_loop = EventLoop::new().unwrap();
-    event_loop.set_control_flow(ControlFlow::Wait);
+    let event_loop = EventLoop::new().expect("Error creating event loop");
+    event_loop.set_control_flow(ControlFlow::Wait); // Use WaitUntil 5ms ?
     let mut app = App::new();
-    event_loop.run_app(&mut app).unwrap();
+    event_loop.run_app(&mut app).expect("Error running app");
 }

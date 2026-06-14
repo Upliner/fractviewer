@@ -72,19 +72,15 @@ mod fragment_shader {
 layout(location = 0) in vec2 f_uv;
 layout(location = 0) out vec4 out_color;
 
-layout(set = 0, binding = 0) uniform usampler2D tile_atlas;
+layout(set = 0, binding = 0) uniform sampler2D tile_atlas;
 layout(set = 0, binding = 1) uniform sampler1D palette;
 
-layout(push_constant) uniform PushConstants {
-    uint max_iterations;
-};
-
 void main() {
-    uint iter = texture(tile_atlas, f_uv).r;
-    if (iter >= max_iterations) {
+    float iter = texture(tile_atlas, f_uv).r;
+    if (iter == 1) {
         out_color = vec4(0.0, 0.0, 0.0, 1.0);
     } else {
-        float t = float(iter) / float(max_iterations);
+        float t = float(iter);
         out_color = texture(palette, t);
     }
 }
@@ -97,7 +93,6 @@ pub struct Renderer {
     tile_sampler: Arc<Sampler>,
     palette_sampler: Arc<Sampler>,
     pub palette_image_view: Arc<ImageView>,
-    pub max_iterations: u32,
 }
 
 impl Renderer {
@@ -105,7 +100,6 @@ impl Renderer {
         device: &Arc<Device>,
         subpass: Subpass,
         memory_allocator: &Arc<StandardMemoryAllocator>,
-        max_iterations: u32,
     ) -> Self {
         let vs = vertex_shader::load(device.clone()).unwrap();
         let fs = fragment_shader::load(device.clone()).unwrap();
@@ -152,8 +146,8 @@ impl Renderer {
         let tile_sampler = Sampler::new(
             device.clone(),
             SamplerCreateInfo {
-                mag_filter: Filter::Nearest,
-                min_filter: Filter::Nearest,
+                mag_filter: Filter::Linear,
+                min_filter: Filter::Linear,
                 address_mode: [SamplerAddressMode::ClampToEdge; 3],
                 ..Default::default()
             },
@@ -178,7 +172,6 @@ impl Renderer {
             tile_sampler,
             palette_sampler,
             palette_image_view,
-            max_iterations,
         }
     }
 
@@ -223,11 +216,11 @@ impl Renderer {
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         memory_allocator: &Arc<StandardMemoryAllocator>,
     ) {
-        let palette_size = 1024u32;
+        let palette_size = 16384u32;
         let mut palette_data: Vec<u8> = Vec::with_capacity(palette_size as usize * 4);
 
         for i in 0..palette_size {
-            let t = i as f32 / palette_size as f32;
+            let t = i as f32 / 4096f32;
             let r = (0.5 + 0.5 * (3.0 + t * std::f32::consts::TAU * 3.0).cos()) * 255.0;
             let g = (0.5 + 0.5 * (3.0 + t * std::f32::consts::TAU * 5.0 + 2.094).cos()) * 255.0;
             let b = (0.5 + 0.5 * (3.0 + t * std::f32::consts::TAU * 7.0 + 4.188).cos()) * 255.0;
@@ -292,14 +285,6 @@ impl Renderer {
             .set_viewport(0, [viewport.clone()].into_iter().collect())
             .unwrap()
             .bind_pipeline_graphics(self.pipeline.clone())
-            .unwrap();
-
-        let push = fragment_shader::PushConstants {
-            max_iterations: self.max_iterations,
-        };
-
-        builder
-            .push_constants(self.pipeline.layout().clone(), 0, push)
             .unwrap();
 
         let vp_w = vp_right - vp_left;
