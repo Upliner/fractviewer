@@ -297,9 +297,11 @@ impl VulkanContext {
 
         match future.map_err(Validated::unwrap) {
             Ok(future) => {
+                future.wait(None).unwrap();
                 self.previous_frame_end = Some(future.boxed());
             }
             Err(VulkanError::OutOfDate) => {
+                eprintln!("Out of date. Recreating swapchain.");
                 self.recreate_swapchain = true;
                 self.previous_frame_end =
                     Some(sync::now(self.device.clone()).boxed());

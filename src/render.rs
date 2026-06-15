@@ -33,7 +33,7 @@ use vulkano::{
     render_pass::{Framebuffer, Subpass},
 };
 
-use crate::tile::{QuadTree, TileCoord, TileSlot};
+use crate::tile::{TILE_SIZE, TileCoord};
 
 #[derive(vulkano::buffer::BufferContents, Vertex, Clone, Copy)]
 #[repr(C)]
@@ -77,7 +77,7 @@ layout(set = 0, binding = 1) uniform sampler1D palette;
 
 void main() {
     float iter = texture(tile_atlas, f_uv).r;
-    if (iter == 1) {
+    if (iter > 65535.0/65536.0) {
         out_color = vec4(0.0, 0.0, 0.0, 1.0);
     } else {
         float t = float(iter);
@@ -263,8 +263,7 @@ impl Renderer {
         viewport: Viewport,
         descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
         memory_allocator: &Arc<StandardMemoryAllocator>,
-        quadtree: &QuadTree,
-        visible_tiles: &[(TileCoord, TileSlot)],
+        visible_tiles: &[(TileCoord, Arc<ImageView>)],
         vp_left: f64,
         vp_right: f64,
         vp_bottom: f64,
@@ -290,9 +289,11 @@ impl Renderer {
         let vp_w = vp_right - vp_left;
         let vp_h = vp_top - vp_bottom;
 
-        for &(coord, slot) in visible_tiles {
-            let atlas = &quadtree.pool.atlases[slot.atlas_index];
-            let uv = slot.uv_rect();
+        let uv1 = 1.0 / TILE_SIZE as f32;
+        let uv2 = 1.0 - uv1;
+
+        for (coord, tile) in visible_tiles {
+
             let (tile_ox, tile_oy) = coord.origin();
             let tile_ext = coord.tile_extent();
 
@@ -303,12 +304,12 @@ impl Renderer {
             let sy1 = ((tile_oy + tile_ext - vp_bottom) / vp_h * 2.0 - 1.0) as f32;
 
             let vertices = [
-                TileVertex { position: [sx0, sy0], uv: [uv[0], uv[1]] },
-                TileVertex { position: [sx1, sy0], uv: [uv[2], uv[1]] },
-                TileVertex { position: [sx0, sy1], uv: [uv[0], uv[3]] },
-                TileVertex { position: [sx1, sy0], uv: [uv[2], uv[1]] },
-                TileVertex { position: [sx1, sy1], uv: [uv[2], uv[3]] },
-                TileVertex { position: [sx0, sy1], uv: [uv[0], uv[3]] },
+                TileVertex { position: [sx0, sy0], uv: [uv1, uv1] },
+                TileVertex { position: [sx1, sy0], uv: [uv2, uv1] },
+                TileVertex { position: [sx0, sy1], uv: [uv1, uv2] },
+                TileVertex { position: [sx1, sy0], uv: [uv2, uv1] },
+                TileVertex { position: [sx1, sy1], uv: [uv2, uv2] },
+                TileVertex { position: [sx0, sy1], uv: [uv1, uv2] },
             ];
 
             let vertex_buffer = Buffer::from_iter(
@@ -332,7 +333,7 @@ impl Renderer {
                 [
                     WriteDescriptorSet::image_view_sampler(
                         0,
-                        atlas.image_view.clone(),
+                        tile.clone(),
                         self.tile_sampler.clone(),
                     ),
                     WriteDescriptorSet::image_view_sampler(

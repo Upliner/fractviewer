@@ -128,7 +128,6 @@ impl App {
             viewport,
             &ctx.descriptor_set_allocator,
             &ctx.memory_allocator,
-            quadtree,
             &visible,
             vp_left,
             vp_right,
@@ -169,7 +168,7 @@ impl ApplicationHandler for App {
             ctx.subpass(),
             &ctx.memory_allocator,
         );
-        let quadtree = QuadTree::new(ctx.memory_allocator.clone());
+        let quadtree = QuadTree::new(ctx.device.clone());
 
         // Upload palette data to GPU
         {

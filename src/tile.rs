@@ -5,18 +5,12 @@ use std::sync::Arc;
 use vulkano::{
     device::Device,
     format::Format,
-    image::{
-        sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo},
-        view::ImageView,
-        Image, ImageCreateInfo, ImageType, ImageUsage,
-    },
-    memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
+    image::{ImageCreateInfo, ImageType, ImageUsage, sys::RawImage, view::ImageView},
+    memory::{DeviceMemory, MemoryAllocateInfo, MemoryPropertyFlags, ResourceMemory, allocator::align_up},
 };
 
 pub const TILE_SIZE: u32 = 256;
-pub const ATLAS_TILES_PER_SIDE: u32 = 16;
-pub const ATLAS_SIZE: u32 = TILE_SIZE * ATLAS_TILES_PER_SIDE; // 4096
-pub const TILES_PER_ATLAS: u32 = ATLAS_TILES_PER_SIDE * ATLAS_TILES_PER_SIDE; // 256
+pub const ARENA_SIZE: u32 = 1024;
 
 /// Root tile covers [-2.5, 1.5] x [-2.0, 2.0] in complex plane.
 pub const ROOT_LEFT: f64 = -2.5;
@@ -86,79 +80,78 @@ impl TileCoord {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct TileSlot {
-    pub atlas_index: usize,
-    pub slot_x: u32,
-    pub slot_y: u32,
+pub struct TileArena {
+    pub items: Vec<Arc<ImageView>>,
+    free_slots: Vec<u32>,
 }
-
-impl TileSlot {
-    /// Pixel offset within the atlas image.
-    pub fn pixel_offset(&self) -> (u32, u32) {
-        (self.slot_x * TILE_SIZE, self.slot_y * TILE_SIZE)
-    }
-
-    /// UV coordinates (0..1) within the atlas for this tile.
-    pub fn uv_rect(&self) -> [f32; 4] {
-        let inv = 1.0 / ATLAS_TILES_PER_SIDE as f32;
-        let u0 = self.slot_x as f32 * inv;
-        let v0 = self.slot_y as f32 * inv;
-        let inv_2 = inv / (TILE_SIZE * 2) as f32;
-        [u0 + inv_2, v0 + inv_2, u0 + inv - inv_2, v0 + inv - inv_2]
-    }
-}
-
-pub struct TileAtlas {
-    pub image: Arc<Image>,
-    pub image_view: Arc<ImageView>,
-    free_slots: Vec<(u32, u32)>,
-}
-
-impl TileAtlas {
-    pub fn new(memory_allocator: &Arc<StandardMemoryAllocator>) -> Self {
-        let image = Image::new(
-            memory_allocator.clone(),
-            ImageCreateInfo {
-                image_type: ImageType::Dim2d,
-                format: Format::R16_UNORM,
-                extent: [ATLAS_SIZE, ATLAS_SIZE, 1],
-                usage: ImageUsage::STORAGE | ImageUsage::SAMPLED,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-                ..Default::default()
-            },
-        )
-        .expect("failed to create atlas image");
-
-        let image_view = ImageView::new_default(image.clone()).unwrap();
-
-        let mut free_slots = Vec::with_capacity(TILES_PER_ATLAS as usize);
-        for sy in (0..ATLAS_TILES_PER_SIDE).rev() {
-            for sx in (0..ATLAS_TILES_PER_SIDE).rev() {
-                free_slots.push((sx, sy));
-            }
-        }
-
-        TileAtlas {
-            image,
-            image_view,
-            free_slots,
+fn find_memory_type(dev: &Device, memory_type_bits : u32) -> Option<u32> {
+    let types = &dev.physical_device().memory_properties().memory_types;
+    for (i, memory_type) in types.iter().enumerate() {
+        if memory_type_bits & (1 << i) != 0 && memory_type.property_flags.contains(MemoryPropertyFlags::DEVICE_LOCAL) {
+            return Some(i as u32);
         }
     }
+    for i in 0..types.len() {
+        if memory_type_bits & (1 << i) != 0 {
+            return Some(i as u32);
+        }
+    }
+    None
+}
+impl TileArena {
+    pub fn new_default(dev: &Arc<Device>) -> Self {
+        Self::new(dev, TILE_SIZE, ARENA_SIZE)
+    }
+    pub fn new(dev: &Arc<Device>, size: u32, count: u32) -> Self {
+        let ici = ImageCreateInfo {
+            image_type: ImageType::Dim2d,
+            format: Format::R16_UNORM,
+            extent: [size, size, 1],
+            usage: ImageUsage::STORAGE | ImageUsage::SAMPLED,
+            ..Default::default()
+        };
+        let make_raw = || { RawImage::new(dev.clone(),ici.clone()).expect("failed to create tile image") };
+        let raw_image = make_raw();
+        let req = raw_image.memory_requirements().first().expect("failed to get memory requirements");
+        let l = req.layout;
+        let sz = align_up(l.size(), l.alignment());
 
-    pub fn allocate_slot(&mut self) -> Option<(u32, u32)> {
-        self.free_slots.pop()
+        let dm = Arc::new(DeviceMemory::allocate(dev.clone(), MemoryAllocateInfo{
+            allocation_size: sz * count as u64,
+            memory_type_index: find_memory_type(dev, req.memory_type_bits).expect("failed to find memory type"),
+            ..Default::default()
+        }).expect("failed to allocate tile memory"));
+
+        let make_iv = |raw_image: RawImage, offset: u64| {
+            ImageView::new_default(Arc::new(raw_image
+                .bind_memory(std::iter::once(unsafe { ResourceMemory::from_device_memory_unchecked(dm.clone(), offset, l.size()) }))
+                .map_err(|e| e.0)
+                .expect("failed to bind memory"))).expect("failed to create image view")
+        };
+
+        let mut items: Vec<Arc<ImageView>> = Vec::with_capacity(count as usize);
+        items.push(make_iv(raw_image, 0));
+
+        for i in 1..count {
+            items.push(make_iv(make_raw(), i as u64 * sz as u64));
+        }
+
+        TileArena {items, free_slots: (0..count).collect()}
     }
 
-    pub fn free_slot(&mut self, sx: u32, sy: u32) {
-        self.free_slots.push((sx, sy));
+    pub fn allocate_slot(&mut self) -> Option<Arc<ImageView>> {
+        match self.free_slots.pop() {
+            Some(index) => Some(self.items[index as usize].clone()),
+            None => None,
+        }
+    }
+
+    pub fn free_slot(&mut self, index: u32) {
+        self.free_slots.push(index);
     }
 
     pub fn is_empty(&self) -> bool {
-        self.free_slots.len() == TILES_PER_ATLAS as usize
+        self.free_slots.len() >= self.items.len()
     }
 
     pub fn has_free_slots(&self) -> bool {
@@ -167,75 +160,72 @@ impl TileAtlas {
 }
 
 pub struct TilePool {
-    pub atlases: Vec<TileAtlas>,
-    memory_allocator: Arc<StandardMemoryAllocator>,
+    arenas: Vec<TileArena>,
+    dev: Arc<Device>,
 }
 
 impl TilePool {
-    pub fn new(memory_allocator: Arc<StandardMemoryAllocator>) -> Self {
+    pub fn new(dev: Arc<Device>) -> Self {
         TilePool {
-            atlases: Vec::new(),
-            memory_allocator,
+            arenas: Vec::new(),
+            dev,
         }
     }
 
-    pub fn allocate(&mut self) -> TileSlot {
-        for (i, atlas) in self.atlases.iter_mut().enumerate() {
-            if let Some((sx, sy)) = atlas.allocate_slot() {
-                return TileSlot {
-                    atlas_index: i,
-                    slot_x: sx,
-                    slot_y: sy,
-                };
+    pub fn allocate(&mut self) -> Arc<ImageView> {
+        for arena in self.arenas.iter_mut() {
+            if let Some(result) = arena.allocate_slot() {
+                return result;
             }
         }
-        let mut atlas = TileAtlas::new(&self.memory_allocator);
-        let (sx, sy) = atlas.allocate_slot().unwrap();
-        let idx = self.atlases.len();
-        self.atlases.push(atlas);
-        TileSlot {
-            atlas_index: idx,
-            slot_x: sx,
-            slot_y: sy,
-        }
+        self.arenas.push_mut(TileArena::new_default(&self.dev)).allocate_slot().unwrap()
     }
 
-    pub fn free(&mut self, slot: TileSlot) {
-        self.atlases[slot.atlas_index].free_slot(slot.slot_x, slot.slot_y);
+    pub fn free(&mut self, slot: &Arc<ImageView>) {
+        for arena in self.arenas.iter_mut() {
+            let index = arena.items.iter().position(|item| item == slot);
+            match index {
+                Some(index) => {
+                    arena.free_slot(index as u32);
+                    return;
+                }
+                None => continue,
+            }
+        }
     }
 }
 
 pub struct QuadTree {
-    pub tiles: HashMap<TileCoord, TileSlot>,
+    pub tiles: HashMap<TileCoord, Arc<ImageView>>,
     pub pool: TilePool,
 }
 
 impl QuadTree {
-    pub fn new(memory_allocator: Arc<StandardMemoryAllocator>) -> Self {
+    pub fn new(dev: Arc<Device>) -> Self {
         QuadTree {
             tiles: HashMap::new(),
-            pool: TilePool::new(memory_allocator),
+            pool: TilePool::new(dev),
         }
     }
 
-    pub fn get(&self, coord: &TileCoord) -> Option<&TileSlot> {
+    pub fn get(&self, coord: &TileCoord) -> Option<&Arc<ImageView>> {
         self.tiles.get(coord)
     }
 
     /// Insert a tile, returning the slot it was assigned.
-    pub fn insert(&mut self, coord: TileCoord) -> TileSlot {
-        if let Some(&slot) = self.tiles.get(&coord) {
-            return slot;
+    pub fn insert(&mut self, coord: TileCoord) -> Arc<ImageView> {
+        if let Some(slot) = self.tiles.get(&coord) {
+            return slot.clone();
         }
         let slot = self.pool.allocate();
-        self.tiles.insert(coord, slot);
+        self.tiles.insert(coord, slot.clone());
         slot
     }
 
     /// Remove a tile and free its slot.
     pub fn remove(&mut self, coord: &TileCoord) {
         if let Some(slot) = self.tiles.remove(coord) {
-            self.pool.free(slot);
+            self.pool.free(&slot);
         }
     }
 
@@ -247,7 +237,7 @@ impl QuadTree {
         vp_right: f64,
         vp_bottom: f64,
         vp_top: f64,
-    ) -> Vec<(TileCoord, TileSlot)> {
+    ) -> Vec<(TileCoord, Arc<ImageView>)> {
         let mut result = Vec::new();
         self.collect_visible(
             TileCoord::root(),
@@ -267,7 +257,7 @@ impl QuadTree {
         vp_right: f64,
         vp_bottom: f64,
         vp_top: f64,
-        result: &mut Vec<(TileCoord, TileSlot)>,
+        result: &mut Vec<(TileCoord, Arc<ImageView>)>,
     ) {
         if !coord.overlaps(vp_left, vp_right, vp_bottom, vp_top) {
             return;
@@ -295,8 +285,8 @@ impl QuadTree {
         }
 
         // Use this tile if it exists
-        if let Some(&slot) = self.tiles.get(&coord) {
-            result.push((coord, slot));
+        if let Some(slot) = self.tiles.get(&coord) {
+            result.push((coord, slot.clone()));
         }
     }
 
@@ -362,19 +352,5 @@ impl QuadTree {
                 );
             }
         }
-    }
-
-    /// Create a nearest-neighbor sampler suitable for integer tile data.
-    pub fn create_tile_sampler(device: &Arc<Device>) -> Arc<Sampler> {
-        Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                mag_filter: Filter::Nearest,
-                min_filter: Filter::Nearest,
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                ..Default::default()
-            },
-        )
-        .unwrap()
     }
 }

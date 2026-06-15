@@ -29,8 +29,6 @@ layout(push_constant) uniform PushConstants {
     double origin_x;
     double origin_y;
     double pixel_scale;
-    int atlas_offset_x;
-    int atlas_offset_y;
     uint max_iterations;
     uint padding;
 };
@@ -38,7 +36,7 @@ layout(push_constant) uniform PushConstants {
 void main() {
     ivec2 local_pos = ivec2(gl_GlobalInvocationID.xy);
 
-    ivec2 atlas_pos = local_pos + ivec2(atlas_offset_x, atlas_offset_y);
+    ivec2 atlas_pos = local_pos;
 
     double cr = origin_x + double(local_pos.x) * pixel_scale;
     double ci = origin_y + double(local_pos.y) * pixel_scale;
@@ -103,9 +101,6 @@ impl ComputeEngine {
         coords: &[TileCoord],
     ) {
         for &coord in coords {
-            let slot = quadtree.insert(coord);
-            let atlas = &quadtree.pool.atlases[slot.atlas_index];
-
             let set = DescriptorSet::new(
                 descriptor_set_allocator.clone(),
                 self.pipeline
@@ -114,20 +109,17 @@ impl ComputeEngine {
                     .get(0)
                     .unwrap()
                     .clone(),
-                [WriteDescriptorSet::image_view(0, atlas.image_view.clone())],
+                [WriteDescriptorSet::image_view(0, quadtree.insert(coord))],
                 [],
             )
             .unwrap();
 
             let (ox, oy) = coord.origin();
-            let (atlas_ox, atlas_oy) = slot.pixel_offset();
 
             let push = mandelbrot_shader::PushConstants {
                 origin_x: ox,
                 origin_y: oy,
                 pixel_scale: coord.pixel_scale(),
-                atlas_offset_x: atlas_ox as i32,
-                atlas_offset_y: atlas_oy as i32,
                 max_iterations: self.max_iterations,
                 padding: 0,
             };
