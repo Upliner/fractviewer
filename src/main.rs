@@ -24,7 +24,6 @@ use render::Renderer;
 use tile::QuadTree;
 
 const MAX_ITERATIONS: u32 = 8192;
-const MAX_COMPUTE_PER_FRAME: usize = 1;
 
 struct App {
     window: Option<Arc<Window>>,
@@ -83,18 +82,6 @@ impl App {
                 .zoom_toward_screen_point(self.cursor_pos.0, self.cursor_pos.1, w, h, direction);
         }
 
-        let (vp_left, vp_right, vp_bottom, vp_top) = self.camera.viewport(w, h);
-        let target_ps = self.camera.pixel_scale(w, h);
-
-        // Find tiles that need computing
-        let needed = quadtree.find_needed_tiles(
-            vp_left,
-            vp_right,
-            vp_bottom,
-            vp_top,
-            target_ps,
-            MAX_COMPUTE_PER_FRAME,
-        );
 
         // Single command buffer for both compute and render
         let mut builder = AutoCommandBufferBuilder::primary(
@@ -104,13 +91,19 @@ impl App {
         )
         .unwrap();
 
+        // Find tiles that need computing
+        let (vp_left, vp_right, vp_bottom, vp_top) = self.camera.viewport(w, h);
+        let needed = quadtree.next_tile(vp_left, vp_right, vp_bottom, vp_top,
+            self.camera.pixel_scale(w, h));
         // Compute needed tiles first
-        compute.dispatch_tiles(
-            &mut builder,
-            &ctx.descriptor_set_allocator,
-            quadtree,
-            &needed,
-        );
+        if let Some(needed) = needed {
+            compute.dispatch_tile(
+                &mut builder,
+                &ctx.descriptor_set_allocator,
+                quadtree.insert(needed),
+                needed,
+            )
+        }
 
         // Collect visible tiles for rendering (includes newly computed ones)
         let visible = quadtree.get_visible_tiles(vp_left, vp_right, vp_bottom, vp_top);
@@ -147,7 +140,7 @@ impl App {
         ctx.present(after_exec, image_index);
 
         // Request continuous redraw if zooming or tiles still needed
-        if self.left_mouse_down || self.right_mouse_down || !needed.is_empty() {
+        if self.left_mouse_down || self.right_mouse_down || needed.is_some() {
             window.request_redraw();
         }
     }

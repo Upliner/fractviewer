@@ -1,19 +1,13 @@
 use std::sync::Arc;
 use vulkano::{
-    command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer},
-    descriptor_set::{
-        allocator::StandardDescriptorSetAllocator, DescriptorSet, WriteDescriptorSet,
-    },
-    device::Device,
-    pipeline::{
-        compute::ComputePipelineCreateInfo,
-        layout::PipelineDescriptorSetLayoutCreateInfo,
-        ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout,
-        PipelineShaderStageCreateInfo,
-    },
+    command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer}, descriptor_set::{
+        DescriptorSet, WriteDescriptorSet, allocator::StandardDescriptorSetAllocator
+    }, device::Device, image::view::ImageView, pipeline::{
+        ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo, compute::ComputePipelineCreateInfo, layout::PipelineDescriptorSetLayoutCreateInfo
+    }
 };
 
-use crate::tile::{QuadTree, TileCoord, TILE_SIZE};
+use crate::tile::{TileCoord, TILE_SIZE};
 
 mod mandelbrot_shader {
     vulkano_shaders::shader! {
@@ -93,54 +87,50 @@ impl ComputeEngine {
     }
 
     /// Record compute dispatches for the given tile coords into a command buffer.
-    pub fn dispatch_tiles(
+    pub fn dispatch_tile(
         &self,
         builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
-        quadtree: &mut QuadTree,
-        coords: &[TileCoord],
+        iv: Arc<ImageView>,
+        coord: TileCoord,
     ) {
-        for &coord in coords {
-            let set = DescriptorSet::new(
-                descriptor_set_allocator.clone(),
-                self.pipeline
-                    .layout()
-                    .set_layouts()
-                    .get(0)
-                    .unwrap()
-                    .clone(),
-                [WriteDescriptorSet::image_view(0, quadtree.insert(coord))],
-                [],
+        let set = DescriptorSet::new(
+            descriptor_set_allocator.clone(),
+            self.pipeline
+                .layout()
+                .set_layouts()
+                .get(0)
+                .unwrap()
+                .clone(),
+            [WriteDescriptorSet::image_view(0, iv)],
+            [],
+        ).unwrap();
+
+        let (ox, oy) = coord.origin();
+        let push = mandelbrot_shader::PushConstants {
+            origin_x: ox,
+            origin_y: oy,
+            pixel_scale: coord.pixel_scale(),
+            max_iterations: self.max_iterations,
+            padding: 0,
+        };
+
+        builder
+            .bind_pipeline_compute(self.pipeline.clone())
+            .unwrap()
+            .bind_descriptor_sets(
+                PipelineBindPoint::Compute,
+                self.pipeline.layout().clone(),
+                0,
+                set,
             )
+            .unwrap()
+            .push_constants(self.pipeline.layout().clone(), 0, push)
             .unwrap();
-
-            let (ox, oy) = coord.origin();
-
-            let push = mandelbrot_shader::PushConstants {
-                origin_x: ox,
-                origin_y: oy,
-                pixel_scale: coord.pixel_scale(),
-                max_iterations: self.max_iterations,
-                padding: 0,
-            };
-
+        unsafe {
             builder
-                .bind_pipeline_compute(self.pipeline.clone())
-                .unwrap()
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Compute,
-                    self.pipeline.layout().clone(),
-                    0,
-                    set,
-                )
-                .unwrap()
-                .push_constants(self.pipeline.layout().clone(), 0, push)
+                .dispatch([TILE_SIZE / 32, TILE_SIZE / 32, 1])
                 .unwrap();
-            unsafe {
-                builder
-                    .dispatch([TILE_SIZE / 32, TILE_SIZE / 32, 1])
-                    .unwrap();
-            }
         }
     }
 

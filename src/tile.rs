@@ -291,32 +291,27 @@ impl QuadTree {
         }
     }
 
-    /// Find tiles that need to be computed to improve resolution for the viewport.
+    /// Find next tiles that need to be computed to improve resolution for the viewport.
     /// Returns coords not yet in the tree that would refine visible areas.
-    pub fn find_needed_tiles(
+    pub fn next_tile(
         &self,
         vp_left: f64,
         vp_right: f64,
         vp_bottom: f64,
         vp_top: f64,
         target_pixel_scale: f64,
-        max_per_frame: usize,
-    ) -> Vec<TileCoord> {
-        let mut needed = Vec::new();
-        self.collect_needed(
+    ) -> Option<TileCoord> {
+        self._next_tile(
             TileCoord::root(),
             vp_left,
             vp_right,
             vp_bottom,
             vp_top,
             target_pixel_scale,
-            &mut needed,
-            max_per_frame,
-        );
-        needed
+        )
     }
 
-    fn collect_needed(
+    fn _next_tile(
         &self,
         coord: TileCoord,
         vp_left: f64,
@@ -324,34 +319,24 @@ impl QuadTree {
         vp_bottom: f64,
         vp_top: f64,
         target_pixel_scale: f64,
-        needed: &mut Vec<TileCoord>,
-        max: usize,
-    ) {
-        if needed.len() >= max {
-            return;
-        }
+    ) -> Option<TileCoord> {
         if !coord.overlaps(vp_left, vp_right, vp_bottom, vp_top) {
-            return;
+            return None;
         }
 
         if !self.tiles.contains_key(&coord) {
-            needed.push(coord);
-            return;
+            return Some(coord);
         }
 
         if coord.pixel_scale() > target_pixel_scale && coord.level < 50 {
             for child in coord.children() {
-                self.collect_needed(
-                    child,
-                    vp_left,
-                    vp_right,
-                    vp_bottom,
-                    vp_top,
-                    target_pixel_scale,
-                    needed,
-                    max,
-                );
+                if let Some(result) = self._next_tile(
+                    child, vp_left, vp_right,
+                        vp_bottom, vp_top, target_pixel_scale) {
+                    return Some(result);
+                }
             }
         }
+        None
     }
 }
