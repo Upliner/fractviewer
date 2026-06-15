@@ -178,6 +178,7 @@ impl TilePool {
                 return result;
             }
         }
+        eprintln!("Allocating arena {}", self.arenas.len() + 1);
         self.arenas.push_mut(TileArena::new_default(&self.dev)).allocate_slot().unwrap()
     }
 

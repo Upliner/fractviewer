@@ -2,18 +2,16 @@ use std::sync::Arc;
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage},
     command_buffer::{
-        AutoCommandBufferBuilder, CopyBufferToImageInfo, PrimaryAutoCommandBuffer,
+        AutoCommandBufferBuilder, PrimaryAutoCommandBuffer,
         RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo,
     },
     descriptor_set::{
         allocator::StandardDescriptorSetAllocator, DescriptorSet, WriteDescriptorSet,
     },
     device::Device,
-    format::Format,
     image::{
         sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo},
         view::ImageView,
-        Image, ImageCreateInfo, ImageType, ImageUsage,
     },
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
@@ -69,20 +67,23 @@ mod fragment_shader {
         src: r"
 #version 460
 
+#define M_PI 3.1415926535897932384626433832795
+
 layout(location = 0) in vec2 f_uv;
 layout(location = 0) out vec4 out_color;
 
-layout(set = 0, binding = 0) uniform sampler2D tile_atlas;
-layout(set = 0, binding = 1) uniform sampler1D palette;
+layout(set = 0, binding = 0) uniform sampler2D tile;
 
 void main() {
-    float iter = texture(tile_atlas, f_uv).r;
-    if (iter > 65535.0/65536.0) {
-        out_color = vec4(0.0, 0.0, 0.0, 1.0);
-    } else {
-        float t = float(iter);
-        out_color = texture(palette, t);
+    float t = texture(tile, f_uv).r;
+    vec3 col = vec3(
+        0.5 + 0.5 * sin(t * M_PI * 3.0),
+        0.5 + 0.5 * sin(t * M_PI * 5.0 + 4.188),
+        0.5 + 0.5 * sin(t * M_PI * 7.0 + 2.094));
+    if (t > 65535.0/65536.0) {
+        col *= t*-65536+65536;
     }
+    out_color = vec4(col, 1.0);
 }
 "
     }
@@ -91,15 +92,12 @@ void main() {
 pub struct Renderer {
     pipeline: Arc<GraphicsPipeline>,
     tile_sampler: Arc<Sampler>,
-    palette_sampler: Arc<Sampler>,
-    pub palette_image_view: Arc<ImageView>,
 }
 
 impl Renderer {
     pub fn new(
         device: &Arc<Device>,
         subpass: Subpass,
-        memory_allocator: &Arc<StandardMemoryAllocator>,
     ) -> Self {
         let vs = vertex_shader::load(device.clone()).unwrap();
         let fs = fragment_shader::load(device.clone()).unwrap();
@@ -122,137 +120,34 @@ impl Renderer {
         )
         .unwrap();
 
-        let pipeline = GraphicsPipeline::new(
-            device.clone(),
-            None,
-            GraphicsPipelineCreateInfo {
-                stages: stages.into_iter().collect(),
-                vertex_input_state: Some(vertex_input_state),
-                input_assembly_state: Some(InputAssemblyState::default()),
-                viewport_state: Some(ViewportState::default()),
-                rasterization_state: Some(RasterizationState::default()),
-                multisample_state: Some(MultisampleState::default()),
-                color_blend_state: Some(ColorBlendState::with_attachment_states(
-                    subpass.num_color_attachments(),
-                    ColorBlendAttachmentState::default(),
-                )),
-                dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-                subpass: Some(subpass.into()),
-                ..GraphicsPipelineCreateInfo::layout(layout)
-            },
-        )
-        .expect("failed to create graphics pipeline");
-
-        let tile_sampler = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                mag_filter: Filter::Linear,
-                min_filter: Filter::Linear,
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        let palette_sampler = Sampler::new(
-            device.clone(),
-            SamplerCreateInfo {
-                mag_filter: Filter::Linear,
-                min_filter: Filter::Linear,
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
-                ..Default::default()
-            },
-        )
-        .unwrap();
-
-        let palette_image_view = Self::create_palette(memory_allocator);
-
         Renderer {
-            pipeline,
-            tile_sampler,
-            palette_sampler,
-            palette_image_view,
+            pipeline: GraphicsPipeline::new(
+                device.clone(),
+                None,
+                GraphicsPipelineCreateInfo {
+                    stages: stages.into_iter().collect(),
+                    vertex_input_state: Some(vertex_input_state),
+                    input_assembly_state: Some(InputAssemblyState::default()),
+                    viewport_state: Some(ViewportState::default()),
+                    rasterization_state: Some(RasterizationState::default()),
+                    multisample_state: Some(MultisampleState::default()),
+                    color_blend_state: Some(ColorBlendState::with_attachment_states(
+                        subpass.num_color_attachments(),
+                        ColorBlendAttachmentState::default(),
+                    )),
+                    dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+                    subpass: Some(subpass.into()),
+                    ..GraphicsPipelineCreateInfo::layout(layout)
+                }).expect("failed to create graphics pipeline"),
+            tile_sampler: Sampler::new(
+                device.clone(),
+                SamplerCreateInfo {
+                    mag_filter: Filter::Linear,
+                    min_filter: Filter::Linear,
+                    address_mode: [SamplerAddressMode::ClampToEdge; 3],
+                    ..Default::default()
+                }).expect("failed to create tile sampler"),
         }
-    }
-
-    fn create_palette(memory_allocator: &Arc<StandardMemoryAllocator>) -> Arc<ImageView> {
-        let palette_size = 1024u32;
-        let mut palette_data: Vec<u8> = Vec::with_capacity(palette_size as usize * 4);
-
-        for i in 0..palette_size {
-            let t = i as f32 / palette_size as f32;
-            let r = (0.5 + 0.5 * (3.0 + t * std::f32::consts::TAU * 3.0).cos()) * 255.0;
-            let g = (0.5 + 0.5 * (3.0 + t * std::f32::consts::TAU * 5.0 + 2.094).cos()) * 255.0;
-            let b = (0.5 + 0.5 * (3.0 + t * std::f32::consts::TAU * 7.0 + 4.188).cos()) * 255.0;
-            palette_data.push(r as u8);
-            palette_data.push(g as u8);
-            palette_data.push(b as u8);
-            palette_data.push(255u8);
-        }
-
-        let image = Image::new(
-            memory_allocator.clone(),
-            ImageCreateInfo {
-                image_type: ImageType::Dim1d,
-                format: Format::R8G8B8A8_UNORM,
-                extent: [palette_size, 1, 1],
-                usage: ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-                ..Default::default()
-            },
-        )
-        .expect("failed to create palette image");
-
-        ImageView::new_default(image).unwrap()
-    }
-
-    /// Build a command buffer that uploads palette data to the palette image.
-    /// Must be submitted before first render.
-    pub fn upload_palette(
-        &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-        memory_allocator: &Arc<StandardMemoryAllocator>,
-    ) {
-        let palette_size = 16384u32;
-        let mut palette_data: Vec<u8> = Vec::with_capacity(palette_size as usize * 4);
-
-        for i in 0..palette_size {
-            let t = i as f32 / 4096f32;
-            let r = (0.5 + 0.5 * (3.0 + t * std::f32::consts::TAU * 3.0).cos()) * 255.0;
-            let g = (0.5 + 0.5 * (3.0 + t * std::f32::consts::TAU * 5.0 + 2.094).cos()) * 255.0;
-            let b = (0.5 + 0.5 * (3.0 + t * std::f32::consts::TAU * 7.0 + 4.188).cos()) * 255.0;
-            palette_data.push(r as u8);
-            palette_data.push(g as u8);
-            palette_data.push(b as u8);
-            palette_data.push(255u8);
-        }
-
-        let staging_buffer = Buffer::from_iter(
-            memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::TRANSFER_SRC,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            palette_data,
-        )
-        .unwrap();
-
-        let image = self.palette_image_view.image().clone();
-
-        builder
-            .copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(
-                staging_buffer,
-                image,
-            ))
-            .unwrap();
     }
 
     /// Record render commands for visible tiles.
@@ -335,12 +230,7 @@ impl Renderer {
                         0,
                         tile.clone(),
                         self.tile_sampler.clone(),
-                    ),
-                    WriteDescriptorSet::image_view_sampler(
-                        1,
-                        self.palette_image_view.clone(),
-                        self.palette_sampler.clone(),
-                    ),
+                    )
                 ],
                 [],
             )

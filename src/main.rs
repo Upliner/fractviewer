@@ -8,7 +8,7 @@ use std::sync::Arc;
 use vulkano::{
     command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage},
     pipeline::graphics::viewport::Viewport,
-    sync::{self, GpuFuture},
+    sync::{GpuFuture},
 };
 use winit::{
     application::ApplicationHandler,
@@ -161,37 +161,10 @@ impl ApplicationHandler for App {
         let attrs = WindowAttributes::default().with_title("Fractal Viewer - Mandelbrot");
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
 
-        let mut ctx = VulkanContext::new(window.clone());
+        let ctx = VulkanContext::new(window.clone());
         let compute = ComputeEngine::new(&ctx.device, MAX_ITERATIONS);
-        let renderer = Renderer::new(
-            &ctx.device,
-            ctx.subpass(),
-            &ctx.memory_allocator,
-        );
+        let renderer = Renderer::new(&ctx.device, ctx.subpass());
         let quadtree = QuadTree::new(ctx.device.clone());
-
-        // Upload palette data to GPU
-        {
-            let mut builder = AutoCommandBufferBuilder::primary(
-                ctx.command_buffer_allocator.clone(),
-                ctx.queue.queue_family_index(),
-                CommandBufferUsage::OneTimeSubmit,
-            )
-            .unwrap();
-            renderer.upload_palette(&mut builder, &ctx.memory_allocator);
-            let cb = builder.build().unwrap();
-            let future = ctx
-                .previous_frame_end
-                .take()
-                .unwrap()
-                .then_execute(ctx.queue.clone(), cb)
-                .unwrap()
-                .then_signal_fence_and_flush()
-                .unwrap();
-            future.wait(None).unwrap();
-            ctx.previous_frame_end =
-                Some(sync::now(ctx.device.clone()).boxed());
-        }
 
         self.ctx = Some(ctx);
         self.compute = Some(compute);
