@@ -80,8 +80,9 @@ void main() {
         0.5 + 0.5 * sin(t * M_PI * 3.0),
         0.5 + 0.5 * sin(t * M_PI * 5.0 + 4.188),
         0.5 + 0.5 * sin(t * M_PI * 7.0 + 2.094));
-    if (t > 65535.0/65536.0) {
-        col *= t*-65536+65536;
+
+    if (t > 15.0/16.0) {
+        col *= t*-16+16;
     }
     out_color = vec4(col, 1.0);
 }
@@ -184,7 +185,7 @@ impl Renderer {
         let vp_w = vp_right - vp_left;
         let vp_h = vp_top - vp_bottom;
 
-        let uv1 = 1.0 / TILE_SIZE as f32;
+        let uv1 = 0.5 / TILE_SIZE as f32;
         let uv2 = 1.0 - uv1;
 
         for (coord, tile) in visible_tiles {

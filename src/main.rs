@@ -8,7 +8,7 @@ use std::sync::Arc;
 use vulkano::{
     command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage},
     pipeline::graphics::viewport::Viewport,
-    sync::{GpuFuture},
+    sync::GpuFuture,
 };
 use winit::{
     application::ApplicationHandler,
