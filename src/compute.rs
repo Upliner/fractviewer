@@ -1,12 +1,15 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
+use smallvec::smallvec;
+use ash::vk;
 use vulkano::{
-    command_buffer::{AutoCommandBufferBuilder, PrimaryAutoCommandBuffer}, descriptor_set::{
-        DescriptorSet, WriteDescriptorSet, allocator::StandardDescriptorSetAllocator
-    }, device::Device, image::view::ImageView, pipeline::{
+    VulkanObject, command_buffer::{CommandBufferBeginInfo, CommandBufferLevel, CommandBufferUsage, RecordingCommandBuffer}, descriptor_set::{
+        WriteDescriptorSet, sys::RawDescriptorSet
+    }, image::{ImageAspects, ImageLayout, ImageSubresourceRange, view::ImageView}, pipeline::{
         ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo, compute::ComputePipelineCreateInfo, layout::PipelineDescriptorSetLayoutCreateInfo
-    }
+    }, sync::{AccessFlags, DependencyInfo, ImageMemoryBarrier, PipelineStages, fence::{Fence, FenceCreateInfo}}
 };
 
+use crate::context::VulkanData;
 use crate::tile::{TileCoord, TILE_SIZE};
 
 mod mandelbrot_shader {
@@ -54,56 +57,53 @@ void main() {
 }
 
 pub struct ComputeEngine {
+    vk: Arc<VulkanData>,
     pipeline: Arc<ComputePipeline>,
     pub max_iterations: u32,
+    fence: Fence,
+    //semaphore: Semaphore,
 }
 
 impl ComputeEngine {
-    pub fn new(device: &Arc<Device>, max_iterations: u32) -> Self {
-        let shader = mandelbrot_shader::load(device.clone())
+    pub fn new(vk: Arc<VulkanData>, max_iterations: u32) -> Self {
+        let dev = vk.device.clone();
+        let shader = mandelbrot_shader::load(dev.clone())
             .expect("failed to load mandelbrot compute shader");
 
         let entry = shader.entry_point("main").unwrap();
         let stage = PipelineShaderStageCreateInfo::new(entry);
         let layout = PipelineLayout::new(
-            device.clone(),
+            dev.clone(),
             PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
-                .into_pipeline_layout_create_info(device.clone())
+                .into_pipeline_layout_create_info(dev.clone())
                 .unwrap(),
         )
         .unwrap();
 
         let pipeline = ComputePipeline::new(
-            device.clone(),
+            dev.clone(),
             None,
             ComputePipelineCreateInfo::stage_layout(stage, layout),
         )
         .expect("failed to create compute pipeline");
 
-        ComputeEngine {
-            pipeline,
-            max_iterations,
+        ComputeEngine{vk, pipeline, max_iterations,
+            fence: Fence::new(dev.clone(), FenceCreateInfo::default()).unwrap(),
+            //semaphore: Semaphore::new(dev, SemaphoreCreateInfo{semaphore_type: SemaphoreType::Timeline,..Default::default() }).unwrap(),
         }
     }
 
     /// Record compute dispatches for the given tile coords into a command buffer.
-    pub fn dispatch_tile(
+    pub fn compute_tile(
         &self,
-        builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
-        descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
         iv: Arc<ImageView>,
         coord: TileCoord,
     ) {
-        let set = DescriptorSet::new(
-            descriptor_set_allocator.clone(),
-            self.pipeline
-                .layout()
-                .set_layouts()
-                .get(0)
-                .unwrap()
-                .clone(),
-            [WriteDescriptorSet::image_view(0, iv)],
-            [],
+        let start = Instant::now();
+        let set = RawDescriptorSet::new(
+            self.vk.descriptor_set_allocator.clone(),
+            &self.pipeline.layout().set_layouts()[0],
+            1
         ).unwrap();
 
         let (ox, oy) = coord.origin();
@@ -115,23 +115,79 @@ impl ComputeEngine {
             padding: 0,
         };
 
-        builder
-            .bind_pipeline_compute(self.pipeline.clone())
+        let mut builder = RecordingCommandBuffer::new(
+            self.vk.command_buffer_allocator.clone(),
+            self.vk.queue.queue_family_index(),
+            CommandBufferLevel::Primary,
+            CommandBufferBeginInfo {
+                usage: CommandBufferUsage::OneTimeSubmit,
+                ..Default::default()
+            },
+        ).unwrap();
+        let bar1 = ImageMemoryBarrier {
+            src_stages: PipelineStages::TOP_OF_PIPE,
+            src_access: AccessFlags::empty(),
+            dst_stages: PipelineStages::COMPUTE_SHADER,
+            dst_access: AccessFlags::SHADER_WRITE,
+            old_layout: ImageLayout::Undefined,
+            new_layout: ImageLayout::General,
+            subresource_range: ImageSubresourceRange{aspects: ImageAspects::COLOR, mip_levels: 0..1, array_layers: 0..1},
+            ..ImageMemoryBarrier::image(iv.image().clone())
+        };
+        let bar2 = ImageMemoryBarrier {
+            src_stages: PipelineStages::COMPUTE_SHADER,
+            src_access: AccessFlags::SHADER_WRITE,
+            dst_stages: PipelineStages::FRAGMENT_SHADER,
+            dst_access: AccessFlags::SHADER_READ,
+            old_layout: ImageLayout::General,
+            new_layout: ImageLayout::ShaderReadOnlyOptimal,
+            subresource_range: ImageSubresourceRange{aspects: ImageAspects::COLOR, mip_levels: 0..1, array_layers: 0..1},
+            ..ImageMemoryBarrier::image(iv.image().clone())
+        };
+        let cb = unsafe {
+            set.update(&[WriteDescriptorSet::image_view(0, iv.clone())], &[])
+                .expect("failed to update descriptor set");
+            builder
+            .bind_pipeline_compute(&self.pipeline)
             .unwrap()
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                self.pipeline.layout().clone(),
-                0,
-                set,
+                &mut self.pipeline.layout(),
+                0,&[&set],&[]
             )
             .unwrap()
-            .push_constants(self.pipeline.layout().clone(), 0, push)
+            .push_constants(&self.pipeline.layout(), 0, &push)
+            .unwrap()
+            .pipeline_barrier(&DependencyInfo{image_memory_barriers: smallvec![bar1],..Default::default()})
+            .unwrap()
+            .dispatch([TILE_SIZE / 32, TILE_SIZE / 32, 1])
+            .unwrap()
+            .pipeline_barrier(&DependencyInfo{image_memory_barriers: smallvec![bar2],..Default::default()})
             .unwrap();
+            builder.end()
+        }.expect("failed to build command buffer");
+        let cb_arr = [cb.handle()];
+        /*let sem_arr = [self.semaphore.handle()];
+        let sem_val = [1u64];
+        let mut tsi = vk::TimelineSemaphoreSubmitInfo::default()
+            .signal_semaphore_values(&sem_val);*/
+        let submit_info = vk::SubmitInfo::default()
+            .command_buffers(&cb_arr)
+            /*.signal_semaphores(&sem_arr)
+            .push_next(&mut tsi)*/;
+        self.vk.queue.with(|_| unsafe {
+            if (self.vk.device.fns().v1_0.queue_submit)(self.vk.queue.handle(), 1, &submit_info, self.fence.handle()) != vk::Result::SUCCESS {
+                panic!("failed to submit command buffer");
+            }
+        });
+        self.fence.wait(None).expect("Vulkan fence wait failed");
+
+        eprintln!("submit+fence took {:?}", start.elapsed());
+        //start = Instant::now();
+        //self.semaphore.wait(SemaphoreWaitInfo{value: 1, ..Default::default()}, None).expect("Semaphore wait failed");
         unsafe {
-            builder
-                .dispatch([TILE_SIZE / 32, TILE_SIZE / 32, 1])
-                .unwrap();
+            self.fence.reset().expect("Vulkan fence reset failed");
+            //self.semaphore.signal(SemaphoreSignalInfo{value: 0, ..Default::default()}).expect("Semaphore reset failed");
         }
     }
-
 }

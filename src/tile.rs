@@ -198,14 +198,12 @@ impl TilePool {
 
 pub struct QuadTree {
     pub tiles: HashMap<TileCoord, Arc<ImageView>>,
-    pub pool: TilePool,
 }
 
 impl QuadTree {
-    pub fn new(dev: Arc<Device>) -> Self {
+    pub fn new() -> Self {
         QuadTree {
             tiles: HashMap::new(),
-            pool: TilePool::new(dev),
         }
     }
 
@@ -214,20 +212,13 @@ impl QuadTree {
     }
 
     /// Insert a tile, returning the slot it was assigned.
-    pub fn insert(&mut self, coord: TileCoord) -> Arc<ImageView> {
-        if let Some(slot) = self.tiles.get(&coord) {
-            return slot.clone();
-        }
-        let slot = self.pool.allocate();
-        self.tiles.insert(coord, slot.clone());
-        slot
+    pub fn insert(&mut self, coord: TileCoord, tile: Arc<ImageView>) {
+        self.tiles.insert(coord, tile);
     }
 
     /// Remove a tile and free its slot.
     pub fn remove(&mut self, coord: &TileCoord) {
-        if let Some(slot) = self.tiles.remove(coord) {
-            self.pool.free(&slot);
-        }
+        self.tiles.remove(coord);
     }
 
     /// Find visible tiles at the best available resolution for the given viewport.

@@ -77,12 +77,12 @@ layout(set = 0, binding = 0) uniform sampler2D tile;
 void main() {
     float t = texture(tile, f_uv).r;
     vec3 col = vec3(
-        0.5 + 0.5 * sin(t * M_PI * 3.0),
-        0.5 + 0.5 * sin(t * M_PI * 5.0 + 4.188),
-        0.5 + 0.5 * sin(t * M_PI * 7.0 + 2.094));
+        0.5 + 0.5 * sin(8 * t * M_PI * 3.0),
+        0.5 + 0.5 * sin(8 * t * M_PI * 5.0 + 4.188),
+        0.5 + 0.5 * sin(8 * t * M_PI * 7.0 + 2.094));
 
-    if (t > 15.0/16.0) {
-        col *= t*-16+16;
+    if (t > 63.0/64.0) {
+        col *= t*-64+64;
     }
     out_color = vec4(col, 1.0);
 }

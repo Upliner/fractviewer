@@ -19,17 +19,30 @@ use vulkano::{
 };
 use winit::window::Window;
 
-pub struct VulkanContext {
+pub struct VulkanData {
     pub device: Arc<Device>,
     pub queue: Arc<Queue>,
+    pub command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+    pub descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
+}
+impl VulkanData {
+    pub fn new(device: Arc<Device>, queue: Arc<Queue>) -> Self {
+        VulkanData {
+            device: device.clone(),
+            queue,
+            command_buffer_allocator: Arc::new(StandardCommandBufferAllocator::new(device.clone(), Default::default())),
+            descriptor_set_allocator: Arc::new(StandardDescriptorSetAllocator::new(device, Default::default())),
+        }
+    }
+}
+pub struct VulkanContext {
+    pub data: Arc<VulkanData>,
     pub surface: Arc<Surface>,
     pub swapchain: Arc<Swapchain>,
     pub swapchain_images: Vec<Arc<Image>>,
     pub render_pass: Arc<RenderPass>,
     pub framebuffers: Vec<Arc<Framebuffer>>,
     pub memory_allocator: Arc<StandardMemoryAllocator>,
-    pub command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
-    pub descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     pub recreate_swapchain: bool,
     pub previous_frame_end: Option<Box<dyn GpuFuture>>,
 }
@@ -43,6 +56,7 @@ impl VulkanContext {
             library,
             InstanceCreateInfo {
                 flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
+                enabled_layers: vec!["VK_LAYER_KHRONOS_validation".to_string()],
                 enabled_extensions: required_extensions,
                 ..Default::default()
             },
@@ -109,8 +123,6 @@ impl VulkanContext {
         )
         .expect("failed to create device");
 
-        let queue = queues.next().unwrap();
-
         let (swapchain, swapchain_images) =
             Self::create_swapchain(&device, &surface, &window, None);
 
@@ -134,28 +146,16 @@ impl VulkanContext {
         let framebuffers = Self::create_framebuffers(&swapchain_images, &render_pass);
 
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
-        let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
-            device.clone(),
-            Default::default(),
-        ));
-        let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
-            device.clone(),
-            Default::default(),
-        ));
 
         let previous_frame_end = Some(sync::now(device.clone()).boxed());
-
         VulkanContext {
-            device,
-            queue,
+            data:Arc::new(VulkanData::new(device.clone(), queues.next().expect("no sutiable Vulkan queue found"))),
             surface,
             swapchain,
             swapchain_images,
             render_pass,
             framebuffers,
             memory_allocator,
-            command_buffer_allocator,
-            descriptor_set_allocator,
             recreate_swapchain: false,
             previous_frame_end,
         }
@@ -248,7 +248,7 @@ impl VulkanContext {
             return;
         }
         let (new_swapchain, new_images) = Self::create_swapchain(
-            &self.device,
+            &self.data.device,
             &self.surface,
             window,
             Some(&self.swapchain),
@@ -287,7 +287,7 @@ impl VulkanContext {
     ) {
         let future = future
             .then_swapchain_present(
-                self.queue.clone(),
+                self.data.queue.clone(),
                 SwapchainPresentInfo::swapchain_image_index(
                     self.swapchain.clone(),
                     image_index,
@@ -304,12 +304,12 @@ impl VulkanContext {
                 eprintln!("Out of date. Recreating swapchain.");
                 self.recreate_swapchain = true;
                 self.previous_frame_end =
-                    Some(sync::now(self.device.clone()).boxed());
+                    Some(sync::now(self.data.device.clone()).boxed());
             }
             Err(e) => {
                 eprintln!("failed to flush future: {e}");
                 self.previous_frame_end =
-                    Some(sync::now(self.device.clone()).boxed());
+                    Some(sync::now(self.data.device.clone()).boxed());
             }
         }
     }
