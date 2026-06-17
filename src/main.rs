@@ -89,11 +89,27 @@ impl Worker {
     fn run(vk: Arc<VulkanData>, data: Arc<SharedData>) {
         let mut pool = TilePool::new(vk.device.clone());
         let compute = ComputeEngine::new(vk.clone(), MAX_ITERATIONS);
+        let mut series_start: bool = false;
+        let mut series_start_time: Instant = Instant::now();
+        let mut tile_count: u32 = 0;
         while data.check_state() {
+            if series_start {
+                series_start = false;
+                series_start_time = Instant::now();
+            }
+            let mut go_idle = || {
+                series_start = true;
+                if tile_count > 0 {
+                    let elapsed = series_start_time.elapsed();
+                    eprintln!("Computed {} tiles in {:?} ({} tiles/s)", tile_count, elapsed, tile_count as f64 / elapsed.as_secs_f64());
+                    tile_count = 0;
+                }
+                data.go_idle();
+            };
             let (w, h) = data.window.inner_size().into();
             if w == 0 || h == 0 {
-                eprintln!("Window is not visible. Going idle");
-                data.go_idle();
+                //eprintln!("Window is not visible. Going idle");
+                go_idle();
                 continue;
             }
 
@@ -105,16 +121,18 @@ impl Worker {
             let tile_coord = data.quadtree.lock().unwrap().next_tile(vp_left, vp_right, vp_bottom, vp_top, pixel_scale);
             if let Some(tile_coord) = tile_coord {
                 let tile = pool.allocate();
-                eprintln!("Computing tile: {:?}", tile_coord);
+                //eprintln!("Computing tile: {:?}", tile_coord);
                 compute.compute_tile(
                     tile.clone(),
                     tile_coord,
                 );
                 data.quadtree.lock().unwrap().insert(tile_coord, tile);
+                //eprintln!("Compute time: {:?}", start.elapsed());
+                tile_count += 1;
                 data.window.request_redraw();
             } else {
-                eprintln!("All tiles are computed. Going idle");
-                data.go_idle();
+                //eprintln!("All tiles are computed. Going idle");
+                go_idle();
             }
         }
     }
@@ -193,7 +211,7 @@ impl AppInternal {
         let vkdata = &self.ctx.data.as_ref();
         let mut builder = AutoCommandBufferBuilder::primary(
             vkdata.command_buffer_allocator.clone(),
-            vkdata.queue.queue_family_index(),
+            vkdata.graphics_queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )
         .unwrap();
@@ -227,11 +245,11 @@ impl AppInternal {
         let previous_future = self.ctx.previous_frame_end.take().unwrap();
         let after_exec = previous_future
             .join(acquire_future)
-            .then_execute(vkdata.queue.clone(), cb)
+            .then_execute(vkdata.graphics_queue.clone(), cb)
             .unwrap()
             .boxed();
 
-        eprintln!("presenting...");
+        //eprintln!("presenting...");
         self.ctx.present(after_exec, image_index);
         eprintln!("Render time: {:?}", start.elapsed());
         // Request continuous redraw if zooming or tiles still needed
@@ -294,6 +312,9 @@ impl ApplicationHandler for App {
         event: WindowEvent,
     ) {
         if event == WindowEvent::CloseRequested {
+            if let Some(app) = self.0.take() {
+                app.worker.finish();
+            }
             event_loop.exit();
         } else if let Some(app) = &mut self.0 {
             app.window_event(event);
@@ -306,7 +327,4 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Wait); // Use WaitUntil 5ms ?
     let mut app = App::new();
     event_loop.run_app(&mut app).expect("Error running app");
-    if let Some(app) = app.0.take() {
-        app.worker.finish();
-    }
 }

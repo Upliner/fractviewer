@@ -21,15 +21,17 @@ use winit::window::Window;
 
 pub struct VulkanData {
     pub device: Arc<Device>,
-    pub queue: Arc<Queue>,
+    pub compute_queue: Arc<Queue>,
+    pub graphics_queue: Arc<Queue>,
     pub command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     pub descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
 }
 impl VulkanData {
-    pub fn new(device: Arc<Device>, queue: Arc<Queue>) -> Self {
+    pub fn new(device: Arc<Device>, compute_queue: Arc<Queue>, graphics_queue: Arc<Queue>) -> Self {
         VulkanData {
             device: device.clone(),
-            queue,
+            compute_queue,
+            graphics_queue,
             command_buffer_allocator: Arc::new(StandardCommandBufferAllocator::new(device.clone(), Default::default())),
             descriptor_set_allocator: Arc::new(StandardDescriptorSetAllocator::new(device, Default::default())),
         }
@@ -71,7 +73,7 @@ impl VulkanContext {
             ..DeviceExtensions::empty()
         };
 
-        let (physical_device, queue_family_index) = instance
+        let (physical_device, queue_create_infos) = instance
             .enumerate_physical_devices()
             .unwrap()
             .filter(|p| p.supported_extensions().contains(&device_extensions))
@@ -80,14 +82,40 @@ impl VulkanContext {
                 features.shader_float64 && features.shader_storage_image_extended_formats
             })
             .filter_map(|p| {
-                p.queue_family_properties()
-                    .iter()
-                    .enumerate()
-                    .position(|(i, q)| {
-                        q.queue_flags.intersects(QueueFlags::GRAPHICS | QueueFlags::COMPUTE)
-                            && p.surface_support(i as u32, &surface).unwrap_or(false)
-                    })
-                    .map(|i| (p, i as u32))
+                let graphics_only_family = p.queue_family_properties().iter().enumerate()
+                    .find(|(_, q)| q.queue_flags.contains(QueueFlags::GRAPHICS) && !q.queue_flags.contains(QueueFlags::COMPUTE) && q.queue_count > 0)
+                    .map(|(i, _)| i as u32);
+                let compute_families = p.queue_family_properties().iter().enumerate().map(|(k, v)| (k as u32, v))
+                    .filter(|(_, q)| q.queue_flags.contains(QueueFlags::COMPUTE) && q.queue_count > 0)
+                    .collect::<Vec<_>>();
+                if compute_families.is_empty() {
+                    return None;
+                }
+                if let Some(graphics_only_family) = graphics_only_family {
+                    return Some((p.clone(), vec![QueueCreateInfo {
+                        queue_family_index: graphics_only_family,
+                        ..Default::default()
+                    }, QueueCreateInfo {
+                        queue_family_index: compute_families[0].0,
+                        ..Default::default()
+                    }]));
+                }
+                let graphics_family = *compute_families.iter().find(|(_, q)| q.queue_flags.contains(QueueFlags::GRAPHICS))?;
+                let separate_compute_family = compute_families.iter().map(|(i, _)| *i).find(|i| *i != graphics_family.0);
+                if let Some(separate_compute_family) = separate_compute_family {
+                    return Some((p.clone(), vec![QueueCreateInfo {
+                        queue_family_index: graphics_family.0,
+                        ..Default::default()
+                    }, QueueCreateInfo {
+                        queue_family_index: separate_compute_family,
+                        ..Default::default()
+                    }]));
+                }
+                Some((p.clone(), vec![QueueCreateInfo {
+                    queue_family_index: graphics_family.0,
+                    queues: if graphics_family.1.queue_count > 1 { vec![0.5, 0.5] } else { vec![0.5] },
+                    ..Default::default()
+                }]))
             })
             .min_by_key(|(p, _)| match p.properties().device_type {
                 PhysicalDeviceType::DiscreteGpu => 0,
@@ -108,10 +136,7 @@ impl VulkanContext {
         let (device, mut queues) = Device::new(
             physical_device,
             DeviceCreateInfo {
-                queue_create_infos: vec![QueueCreateInfo {
-                    queue_family_index,
-                    ..Default::default()
-                }],
+                queue_create_infos,
                 enabled_extensions: device_extensions,
                 enabled_features: DeviceFeatures {
                     shader_float64: true,
@@ -144,12 +169,12 @@ impl VulkanContext {
         .unwrap();
 
         let framebuffers = Self::create_framebuffers(&swapchain_images, &render_pass);
-
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
-
         let previous_frame_end = Some(sync::now(device.clone()).boxed());
+        let graphics_queue = queues.next().expect("Vulkan queue was not created as expected");
+        let compute_queue = queues.next().unwrap_or(graphics_queue.clone());
         VulkanContext {
-            data:Arc::new(VulkanData::new(device.clone(), queues.next().expect("no sutiable Vulkan queue found"))),
+            data:Arc::new(VulkanData::new(device.clone(), compute_queue, graphics_queue)),
             surface,
             swapchain,
             swapchain_images,
@@ -287,7 +312,7 @@ impl VulkanContext {
     ) {
         let future = future
             .then_swapchain_present(
-                self.data.queue.clone(),
+                self.data.graphics_queue.clone(),
                 SwapchainPresentInfo::swapchain_image_index(
                     self.swapchain.clone(),
                     image_index,

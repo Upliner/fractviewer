@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
 use smallvec::smallvec;
 use ash::vk;
 use vulkano::{
@@ -6,7 +6,7 @@ use vulkano::{
         WriteDescriptorSet, sys::RawDescriptorSet
     }, image::{ImageAspects, ImageLayout, ImageSubresourceRange, view::ImageView}, pipeline::{
         ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo, compute::ComputePipelineCreateInfo, layout::PipelineDescriptorSetLayoutCreateInfo
-    }, sync::{AccessFlags, DependencyInfo, ImageMemoryBarrier, PipelineStages, fence::{Fence, FenceCreateInfo}}
+    }, sync::{AccessFlags, DependencyInfo, ImageMemoryBarrier, PipelineStages, QueueFamilyOwnershipTransfer, fence::{Fence, FenceCreateInfo}}
 };
 
 use crate::context::VulkanData;
@@ -99,7 +99,6 @@ impl ComputeEngine {
         iv: Arc<ImageView>,
         coord: TileCoord,
     ) {
-        let start = Instant::now();
         let set = RawDescriptorSet::new(
             self.vk.descriptor_set_allocator.clone(),
             &self.pipeline.layout().set_layouts()[0],
@@ -117,7 +116,7 @@ impl ComputeEngine {
 
         let mut builder = RecordingCommandBuffer::new(
             self.vk.command_buffer_allocator.clone(),
-            self.vk.queue.queue_family_index(),
+            self.vk.compute_queue.queue_family_index(),
             CommandBufferLevel::Primary,
             CommandBufferBeginInfo {
                 usage: CommandBufferUsage::OneTimeSubmit,
@@ -126,23 +125,39 @@ impl ComputeEngine {
         ).unwrap();
         let bar1 = ImageMemoryBarrier {
             src_stages: PipelineStages::TOP_OF_PIPE,
-            src_access: AccessFlags::empty(),
             dst_stages: PipelineStages::COMPUTE_SHADER,
+            src_access: AccessFlags::empty(),
             dst_access: AccessFlags::SHADER_WRITE,
             old_layout: ImageLayout::Undefined,
             new_layout: ImageLayout::General,
             subresource_range: ImageSubresourceRange{aspects: ImageAspects::COLOR, mip_levels: 0..1, array_layers: 0..1},
             ..ImageMemoryBarrier::image(iv.image().clone())
         };
-        let bar2 = ImageMemoryBarrier {
-            src_stages: PipelineStages::COMPUTE_SHADER,
-            src_access: AccessFlags::SHADER_WRITE,
-            dst_stages: PipelineStages::FRAGMENT_SHADER,
-            dst_access: AccessFlags::SHADER_READ,
-            old_layout: ImageLayout::General,
-            new_layout: ImageLayout::ShaderReadOnlyOptimal,
-            subresource_range: ImageSubresourceRange{aspects: ImageAspects::COLOR, mip_levels: 0..1, array_layers: 0..1},
-            ..ImageMemoryBarrier::image(iv.image().clone())
+        let queue_transfer = self.vk.compute_queue.queue_family_index() != self.vk.graphics_queue.queue_family_index();
+        let bar2 = if queue_transfer {
+            ImageMemoryBarrier {
+                src_stages: PipelineStages::COMPUTE_SHADER,
+                dst_stages: PipelineStages::BOTTOM_OF_PIPE,
+                src_access: AccessFlags::SHADER_WRITE,
+                dst_access: AccessFlags::empty(),
+                old_layout: ImageLayout::General,
+                new_layout: ImageLayout::ShaderReadOnlyOptimal,
+                queue_family_ownership_transfer: Some(QueueFamilyOwnershipTransfer::ExclusiveBetweenLocal {
+                    src_index: self.vk.compute_queue.queue_family_index(), dst_index: self.vk.graphics_queue.queue_family_index()}),
+                subresource_range: ImageSubresourceRange{aspects: ImageAspects::COLOR, mip_levels: 0..1, array_layers: 0..1},
+                ..ImageMemoryBarrier::image(iv.image().clone())
+            }
+        } else {
+            ImageMemoryBarrier {
+                src_stages: PipelineStages::COMPUTE_SHADER,
+                dst_stages: PipelineStages::FRAGMENT_SHADER,
+                src_access: AccessFlags::SHADER_WRITE,
+                dst_access: AccessFlags::SHADER_READ,
+                old_layout: ImageLayout::General,
+                new_layout: ImageLayout::ShaderReadOnlyOptimal,
+                subresource_range: ImageSubresourceRange{aspects: ImageAspects::COLOR, mip_levels: 0..1, array_layers: 0..1},
+                ..ImageMemoryBarrier::image(iv.image().clone())
+            }
         };
         let cb = unsafe {
             set.update(&[WriteDescriptorSet::image_view(0, iv.clone())], &[])
@@ -165,29 +180,59 @@ impl ComputeEngine {
             .pipeline_barrier(&DependencyInfo{image_memory_barriers: smallvec![bar2],..Default::default()})
             .unwrap();
             builder.end()
-        }.expect("failed to build command buffer");
+        }.expect("failed to build compute command buffer");
         let cb_arr = [cb.handle()];
-        /*let sem_arr = [self.semaphore.handle()];
-        let sem_val = [1u64];
-        let mut tsi = vk::TimelineSemaphoreSubmitInfo::default()
-            .signal_semaphore_values(&sem_val);*/
-        let submit_info = vk::SubmitInfo::default()
-            .command_buffers(&cb_arr)
-            /*.signal_semaphores(&sem_arr)
-            .push_next(&mut tsi)*/;
-        self.vk.queue.with(|_| unsafe {
-            if (self.vk.device.fns().v1_0.queue_submit)(self.vk.queue.handle(), 1, &submit_info, self.fence.handle()) != vk::Result::SUCCESS {
-                panic!("failed to submit command buffer");
+        let submit_info = vk::SubmitInfo::default().command_buffers(&cb_arr);
+        self.vk.compute_queue.with(|_| unsafe {
+            let result = (self.vk.device.fns().v1_0.queue_submit)(self.vk.compute_queue.handle(), 1, &submit_info, self.fence.handle());
+            if result != vk::Result::SUCCESS {
+                panic!("failed to submit compute command buffer");
             }
         });
         self.fence.wait(None).expect("Vulkan fence wait failed");
-
-        eprintln!("submit+fence took {:?}", start.elapsed());
-        //start = Instant::now();
-        //self.semaphore.wait(SemaphoreWaitInfo{value: 1, ..Default::default()}, None).expect("Semaphore wait failed");
         unsafe {
             self.fence.reset().expect("Vulkan fence reset failed");
-            //self.semaphore.signal(SemaphoreSignalInfo{value: 0, ..Default::default()}).expect("Semaphore reset failed");
+        }
+        if queue_transfer {
+            let mut builder = RecordingCommandBuffer::new(
+                self.vk.command_buffer_allocator.clone(),
+                self.vk.graphics_queue.queue_family_index(),
+                CommandBufferLevel::Primary,
+                CommandBufferBeginInfo {
+                    usage: CommandBufferUsage::OneTimeSubmit,
+                    ..Default::default()
+                },
+            ).unwrap();
+            let bar = ImageMemoryBarrier {
+                src_stages: PipelineStages::TOP_OF_PIPE,
+                dst_stages: PipelineStages::FRAGMENT_SHADER,
+                src_access: AccessFlags::empty(),
+                dst_access: AccessFlags::SHADER_READ,
+                old_layout: ImageLayout::General,
+                new_layout: ImageLayout::ShaderReadOnlyOptimal,
+                queue_family_ownership_transfer: Some(QueueFamilyOwnershipTransfer::ExclusiveBetweenLocal {
+                    src_index: self.vk.compute_queue.queue_family_index(), dst_index: self.vk.graphics_queue.queue_family_index()}),
+                subresource_range: ImageSubresourceRange{aspects: ImageAspects::COLOR, mip_levels: 0..1, array_layers: 0..1},
+                ..ImageMemoryBarrier::image(iv.image().clone())
+            };
+            let cb = unsafe {
+                builder
+                .pipeline_barrier(&DependencyInfo{image_memory_barriers: smallvec![bar],..Default::default()})
+                .unwrap();
+                builder.end()
+            }.expect("failed to build queue transfer command buffer");
+            let cb_arr = [cb.handle()];
+            let submit_info = vk::SubmitInfo::default().command_buffers(&cb_arr);
+            self.vk.graphics_queue.with(|_| unsafe {
+                let result = (self.vk.device.fns().v1_0.queue_submit)(self.vk.graphics_queue.handle(), 1, &submit_info, self.fence.handle());
+                if result != vk::Result::SUCCESS {
+                    panic!("failed to submit queue transfer command buffer");
+                }
+            });
+            self.fence.wait(None).expect("Vulkan fence wait failed");
+            unsafe {
+                self.fence.reset().expect("Vulkan fence reset failed");
+            }
         }
     }
 }
