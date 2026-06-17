@@ -108,7 +108,6 @@ impl Worker {
             };
             let (w, h) = data.window.inner_size().into();
             if w == 0 || h == 0 {
-                //eprintln!("Window is not visible. Going idle");
                 go_idle();
                 continue;
             }
@@ -121,17 +120,14 @@ impl Worker {
             let tile_coord = data.quadtree.lock().unwrap().next_tile(vp_left, vp_right, vp_bottom, vp_top, pixel_scale);
             if let Some(tile_coord) = tile_coord {
                 let tile = pool.allocate();
-                //eprintln!("Computing tile: {:?}", tile_coord);
                 compute.compute_tile(
                     tile.clone(),
                     tile_coord,
                 );
                 data.quadtree.lock().unwrap().insert(tile_coord, tile);
-                //eprintln!("Compute time: {:?}", start.elapsed());
                 tile_count += 1;
                 data.window.request_redraw();
             } else {
-                //eprintln!("All tiles are computed. Going idle");
                 go_idle();
             }
         }

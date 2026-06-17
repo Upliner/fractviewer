@@ -3,9 +3,9 @@ use smallvec::smallvec;
 use ash::vk;
 use vulkano::{
     VulkanObject, command_buffer::{CommandBufferBeginInfo, CommandBufferLevel, CommandBufferUsage, RecordingCommandBuffer}, descriptor_set::{
-        WriteDescriptorSet, sys::RawDescriptorSet
+        WriteDescriptorSet, layout::DescriptorSetLayout, sys::RawDescriptorSet
     }, image::{ImageAspects, ImageLayout, ImageSubresourceRange, view::ImageView}, pipeline::{
-        ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo, compute::ComputePipelineCreateInfo, layout::PipelineDescriptorSetLayoutCreateInfo
+        ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo, compute::ComputePipelineCreateInfo, layout::{PipelineDescriptorSetLayoutCreateInfo, PipelineLayoutCreateInfo}
     }, sync::{AccessFlags, DependencyInfo, ImageMemoryBarrier, PipelineStages, QueueFamilyOwnershipTransfer, fence::{Fence, FenceCreateInfo}}
 };
 
@@ -18,9 +18,9 @@ mod mandelbrot_shader {
         src: r"
 #version 460
 
-layout(local_size_x = 32, local_size_y = 32) in;
+layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(set = 0, binding = 0) uniform writeonly image2D atlas;
+layout(set = 0, binding = 0) uniform writeonly image2D tile;
 
 layout(push_constant) uniform PushConstants {
     double origin_x;
@@ -32,8 +32,6 @@ layout(push_constant) uniform PushConstants {
 
 void main() {
     ivec2 local_pos = ivec2(gl_GlobalInvocationID.xy);
-
-    ivec2 atlas_pos = local_pos;
 
     double cr = origin_x + double(local_pos.x) * pixel_scale;
     double ci = origin_y + double(local_pos.y) * pixel_scale;
@@ -50,18 +48,18 @@ void main() {
         zr = zr2 - zi2 + cr;
     }
 
-    imageStore(atlas, atlas_pos, vec4(float(iter) / float(max_iterations), 0.0, 0.0, 0.0));
+    imageStore(tile, local_pos, vec4(float(iter) / float(max_iterations), 0.0, 0.0, 0.0));
 }
 "
     }
 }
 
 pub struct ComputeEngine {
+    pub max_iterations: u32,
+    dset: RawDescriptorSet,
     vk: Arc<VulkanData>,
     pipeline: Arc<ComputePipeline>,
-    pub max_iterations: u32,
     fence: Fence,
-    //semaphore: Semaphore,
 }
 
 impl ComputeEngine {
@@ -72,13 +70,14 @@ impl ComputeEngine {
 
         let entry = shader.entry_point("main").unwrap();
         let stage = PipelineShaderStageCreateInfo::new(entry);
-        let layout = PipelineLayout::new(
-            dev.clone(),
-            PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
-                .into_pipeline_layout_create_info(dev.clone())
-                .unwrap(),
-        )
-        .unwrap();
+        let pdslci = PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage]);
+        let dset_layout = DescriptorSetLayout::new(dev.clone(), pdslci.set_layouts[0].clone()).unwrap();
+        let layout = PipelineLayout::new(dev.clone(), PipelineLayoutCreateInfo {
+            flags: pdslci.flags,
+            set_layouts: vec![dset_layout.clone()],
+            push_constant_ranges: pdslci.push_constant_ranges,
+            ..Default::default()
+        }).unwrap();
 
         let pipeline = ComputePipeline::new(
             dev.clone(),
@@ -87,7 +86,12 @@ impl ComputeEngine {
         )
         .expect("failed to create compute pipeline");
 
-        ComputeEngine{vk, pipeline, max_iterations,
+        ComputeEngine{max_iterations, pipeline,
+            dset: RawDescriptorSet::new(
+                vk.descriptor_set_allocator.clone(),
+                &dset_layout,
+                1
+            ).unwrap(), vk,
             fence: Fence::new(dev.clone(), FenceCreateInfo::default()).unwrap(),
             //semaphore: Semaphore::new(dev, SemaphoreCreateInfo{semaphore_type: SemaphoreType::Timeline,..Default::default() }).unwrap(),
         }
@@ -99,12 +103,6 @@ impl ComputeEngine {
         iv: Arc<ImageView>,
         coord: TileCoord,
     ) {
-        let set = RawDescriptorSet::new(
-            self.vk.descriptor_set_allocator.clone(),
-            &self.pipeline.layout().set_layouts()[0],
-            1
-        ).unwrap();
-
         let (ox, oy) = coord.origin();
         let push = mandelbrot_shader::PushConstants {
             origin_x: ox,
@@ -160,7 +158,7 @@ impl ComputeEngine {
             }
         };
         let cb = unsafe {
-            set.update(&[WriteDescriptorSet::image_view(0, iv.clone())], &[])
+            self.dset.update(&[WriteDescriptorSet::image_view(0, iv.clone())], &[])
                 .expect("failed to update descriptor set");
             builder
             .bind_pipeline_compute(&self.pipeline)
@@ -168,14 +166,14 @@ impl ComputeEngine {
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
                 &mut self.pipeline.layout(),
-                0,&[&set],&[]
+                0,&[&self.dset],&[]
             )
             .unwrap()
             .push_constants(&self.pipeline.layout(), 0, &push)
             .unwrap()
             .pipeline_barrier(&DependencyInfo{image_memory_barriers: smallvec![bar1],..Default::default()})
             .unwrap()
-            .dispatch([TILE_SIZE / 32, TILE_SIZE / 32, 1])
+            .dispatch([TILE_SIZE / 16, TILE_SIZE / 16, 1])
             .unwrap()
             .pipeline_barrier(&DependencyInfo{image_memory_barriers: smallvec![bar2],..Default::default()})
             .unwrap();
