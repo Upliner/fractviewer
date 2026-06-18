@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
+use smallvec::SmallVec;
 use vulkano::{
     device::Device,
     format::Format,
@@ -276,16 +277,21 @@ impl QuadTreeNode {
         vp_top: f64,
         target_pixel_scale: f64,
     ) -> Option<TileCoord> {
-        for (child_coord, child) in coord.children().into_iter().zip(self.children.iter()) {
-            if !child_coord.overlaps(vp_left, vp_right, vp_bottom, vp_top) || coord.pixel_scale() <= target_pixel_scale || coord.level >= MAX_DEPTH {
-                continue;
+        let children = coord.children().into_iter().zip(self.children.iter())
+            /* */.filter(|(child_coord, _)| child_coord.overlaps(vp_left, vp_right, vp_bottom, vp_top)).collect::<SmallVec<[_; 4]>>();
+        for (child_coord, child) in &children {
+            if child.is_none() {
+                return Some(child_coord.clone());
             }
-            match child {
-                None => return Some(child_coord),
-                Some(child) =>
-                    if let Some(result) = child.next_tile(child_coord, vp_left, vp_right, vp_bottom, vp_top, target_pixel_scale) {
-                        return Some(result);
-                    }
+        }
+        if coord.level >= MAX_DEPTH || coord.pixel_scale() <= target_pixel_scale {
+            return None;
+        }
+        for (child_coord, child) in children {
+            if let Some(child) = child {
+                if let Some(result) = child.next_tile(child_coord, vp_left, vp_right, vp_bottom, vp_top, target_pixel_scale) {
+                    return Some(result);
+                }
             }
         }
         None
@@ -352,7 +358,7 @@ impl QuadTree {
                 vp_right,
                 vp_bottom,
                 vp_top,
-                target_pixel_scale),
+                target_pixel_scale * 2.0),
         }
     }
 }

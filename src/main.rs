@@ -205,7 +205,7 @@ impl AppInternal {
             camera.zoom_toward_screen_point(self.cursor_pos.0, self.cursor_pos.1, w, h, direction);
         }
         drop(camera);
-        let start = Instant::now();
+        //let start = Instant::now();
         let vkdata = &self.ctx.data.as_ref();
         let mut builder = AutoCommandBufferBuilder::primary(
             vkdata.command_buffer_allocator.clone(),
@@ -248,7 +248,7 @@ impl AppInternal {
             .boxed();
 
         self.ctx.present(after_exec, image_index);
-        eprintln!("Render time: {:?}", start.elapsed());
+        //eprintln!("Render time: {:?}", start.elapsed());
         // Request continuous redraw if zooming or tiles still needed
         if self.left_mouse_down || self.right_mouse_down {
             self.window().request_redraw();
