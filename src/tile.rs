@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use vulkano::{
     device::Device,
@@ -51,6 +50,17 @@ impl TileCoord {
                 y: self.y / 2,
             })
         }
+    }
+    pub fn child(&self) -> (usize, TileCoord) {
+        let lev = self.level - 1;
+        let mask = !((!0u64) << lev);
+        (((self.y >> lev) * 2 + (self.x >> lev)) as usize,
+            TileCoord {
+                level: lev,
+                x: self.x & mask,
+                y: self.y & mask,
+            }
+        )
     }
 
     /// Size of one tile at this level in complex-plane units.
@@ -196,50 +206,38 @@ impl TilePool {
     }
 }
 
-pub struct QuadTree {
-    pub tiles: HashMap<TileCoord, Arc<ImageView>>,
+const MAX_DEPTH: u32 = 46;
+
+struct QuadTreeNode {
+    item: Arc<ImageView>,
+    children: [Option<Box<QuadTreeNode>>; 4],
 }
 
-impl QuadTree {
-    pub fn new() -> Self {
-        QuadTree {
-            tiles: HashMap::new(),
+impl QuadTreeNode {
+    fn new(item: Arc<ImageView>) -> Self {
+        QuadTreeNode {item: item, children: Default::default()}
+    }
+
+    fn get(&self, coord: TileCoord) -> Option<&Arc<ImageView>> {
+        match coord.level {
+            0 => Some(&self.item),
+            _ => {
+                let (quadrant, child_coord) = coord.child();
+                self.children[quadrant].as_ref()?.get(child_coord)
+            }
         }
     }
-
-    pub fn get(&self, coord: &TileCoord) -> Option<&Arc<ImageView>> {
-        self.tiles.get(coord)
-    }
-
-    /// Insert a tile, returning the slot it was assigned.
-    pub fn insert(&mut self, coord: TileCoord, tile: Arc<ImageView>) {
-        self.tiles.insert(coord, tile);
-    }
-
-    /// Remove a tile and free its slot.
-    pub fn remove(&mut self, coord: &TileCoord) {
-        self.tiles.remove(coord);
-    }
-
-    /// Find visible tiles at the best available resolution for the given viewport.
-    /// Returns list of (TileCoord, TileSlot, screen_rect) for rendering.
-    pub fn get_visible_tiles(
-        &self,
-        vp_left: f64,
-        vp_right: f64,
-        vp_bottom: f64,
-        vp_top: f64,
-    ) -> Vec<(TileCoord, Arc<ImageView>)> {
-        let mut result = Vec::new();
-        self.collect_visible(
-            TileCoord::root(),
-            vp_left,
-            vp_right,
-            vp_bottom,
-            vp_top,
-            &mut result,
-        );
-        result
+    fn insert(&mut self, coord: TileCoord, tile: Option<Arc<ImageView>>) -> bool {
+        match coord.level {
+            1 => {self.children[(coord.y * 2 + coord.x) as usize] = tile.map(|t| Box::new(QuadTreeNode::new(t))); true}
+            _ => {
+                let (quadrant, child_coord) = coord.child();
+                match self.children[quadrant].as_mut() {
+                    Some(child) => child.insert(child_coord, tile),
+                    None => false,
+                }
+            }
+        }
     }
 
     fn collect_visible(
@@ -249,39 +247,92 @@ impl QuadTree {
         vp_right: f64,
         vp_bottom: f64,
         vp_top: f64,
+        target_pixel_scale: f64,
         result: &mut Vec<(TileCoord, Arc<ImageView>)>,
     ) {
         if !coord.overlaps(vp_left, vp_right, vp_bottom, vp_top) {
             return;
         }
-        // Try to go deeper if children exist
-        let children = coord.children();
-        let all_children_exist = children.iter().all(|c| {
-            self.tiles.contains_key(c)
-                && c.overlaps(vp_left, vp_right, vp_bottom, vp_top)
-                || !c.overlaps(vp_left, vp_right, vp_bottom, vp_top)
-        });
-
-        if all_children_exist && coord.level < 50 {
-            // Check if any child actually needs to be visible
-            let mut any_child_visible = false;
-            for child in &children {
-                if child.overlaps(vp_left, vp_right, vp_bottom, vp_top) {
-                    any_child_visible = true;
-                    self.collect_visible(*child, vp_left, vp_right, vp_bottom, vp_top, result);
-                }
-            }
-            if any_child_visible {
-                return;
-            }
+        let target_depth = coord.pixel_scale() <= target_pixel_scale || coord.level >= MAX_DEPTH;
+        if target_depth || self.children.iter().any(|c| c.is_none()) {
+            result.push((coord.clone(), self.item.clone()));
         }
-
-        // Use this tile if it exists
-        if let Some(slot) = self.tiles.get(&coord) {
-            result.push((coord, slot.clone()));
+        if target_depth {
+            return;
+        }
+        for (child_coord, child) in coord.children().into_iter().zip(self.children.iter()) {
+            if let Some(child) = child {
+                child.collect_visible(child_coord, vp_left, vp_right, vp_bottom, vp_top, target_pixel_scale, result);
+            }
         }
     }
 
+    fn next_tile(
+        &self,
+        coord: TileCoord,
+        vp_left: f64,
+        vp_right: f64,
+        vp_bottom: f64,
+        vp_top: f64,
+        target_pixel_scale: f64,
+    ) -> Option<TileCoord> {
+        for (child_coord, child) in coord.children().into_iter().zip(self.children.iter()) {
+            if !child_coord.overlaps(vp_left, vp_right, vp_bottom, vp_top) || coord.pixel_scale() <= target_pixel_scale || coord.level >= MAX_DEPTH {
+                continue;
+            }
+            match child {
+                None => return Some(child_coord),
+                Some(child) =>
+                    if let Some(result) = child.next_tile(child_coord, vp_left, vp_right, vp_bottom, vp_top, target_pixel_scale) {
+                        return Some(result);
+                    }
+            }
+        }
+        None
+    }
+}
+pub struct QuadTree {
+    root: Option<QuadTreeNode>,
+}
+impl QuadTree {
+    pub fn new() -> Self {
+        QuadTree { root: None }
+    }
+    pub fn insert(&mut self, coord: TileCoord, tile: Option<Arc<ImageView>>) -> bool {
+        match coord.level {
+            0 => { self.root = tile.map(|t| QuadTreeNode::new(t)); true}
+            _ => {
+                match self.root.as_mut() {
+                    Some(root) => root.insert(coord, tile),
+                    None => false,
+                }
+            }
+        }
+    }
+    /// Find visible tiles at the best available resolution for the given viewport.
+    /// Returns list of (TileCoord, TileSlot, screen_rect) for rendering.
+    pub fn get_visible_tiles(
+        &self,
+        vp_left: f64,
+        vp_right: f64,
+        vp_bottom: f64,
+        vp_top: f64,
+        target_pixel_scale: f64,
+    ) -> Vec<(TileCoord, Arc<ImageView>)> {
+        let mut result = Vec::new();
+        if let Some(root) = &self.root {
+            root.collect_visible(
+                TileCoord::root(),
+                vp_left,
+                vp_right,
+                vp_bottom,
+                vp_top,
+                target_pixel_scale,
+                &mut result,
+            );
+        }
+        result
+    }
     /// Find next tiles that need to be computed to improve resolution for the viewport.
     /// Returns coords not yet in the tree that would refine visible areas.
     pub fn next_tile(
@@ -292,42 +343,16 @@ impl QuadTree {
         vp_top: f64,
         target_pixel_scale: f64,
     ) -> Option<TileCoord> {
-        self._next_tile(
-            TileCoord::root(),
-            vp_left,
-            vp_right,
-            vp_bottom,
-            vp_top,
-            target_pixel_scale,
-        )
-    }
-
-    fn _next_tile(
-        &self,
-        coord: TileCoord,
-        vp_left: f64,
-        vp_right: f64,
-        vp_bottom: f64,
-        vp_top: f64,
-        target_pixel_scale: f64,
-    ) -> Option<TileCoord> {
-        if !coord.overlaps(vp_left, vp_right, vp_bottom, vp_top) {
-            return None;
+        let root_coord = TileCoord::root();
+        match &self.root {
+            None => Some(root_coord),
+            Some(root) => root.next_tile(
+                root_coord,
+                vp_left,
+                vp_right,
+                vp_bottom,
+                vp_top,
+                target_pixel_scale),
         }
-
-        if !self.tiles.contains_key(&coord) {
-            return Some(coord);
-        }
-
-        if coord.pixel_scale() > target_pixel_scale && coord.level < 50 {
-            for child in coord.children() {
-                if let Some(result) = self._next_tile(
-                    child, vp_left, vp_right,
-                        vp_bottom, vp_top, target_pixel_scale) {
-                    return Some(result);
-                }
-            }
-        }
-        None
     }
 }

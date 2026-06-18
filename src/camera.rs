@@ -68,7 +68,7 @@ impl Camera {
     }
 
     /// Returns (left, right, bottom, top) in complex plane coordinates.
-    pub fn viewport(&self, window_width: u32, window_height: u32) -> (f64, f64, f64, f64) {
+    pub fn viewport(&self, window_width: u32, window_height: u32) -> (f64, f64, f64, f64, f64) {
         let aspect = window_width as f64 / window_height as f64;
         let half_w = self.scale * aspect;
         let half_h = self.scale;
@@ -77,11 +77,7 @@ impl Camera {
             self.center_x + half_w,
             self.center_y - half_h,
             self.center_y + half_h,
+            (self.scale * 2.0) / window_height as f64, // Complex-plane units per pixel at current zoom/window size.
         )
-    }
-
-    /// Complex-plane units per pixel at current zoom/window size.
-    pub fn pixel_scale(&self, _window_width: u32, window_height: u32) -> f64 {
-        (self.scale * 2.0) / window_height as f64
     }
 }

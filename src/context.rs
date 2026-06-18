@@ -101,7 +101,7 @@ impl VulkanContext {
                     }]));
                 }
                 let graphics_family = *compute_families.iter().find(|(_, q)| q.queue_flags.contains(QueueFlags::GRAPHICS))?;
-                let separate_compute_family = compute_families.iter().map(|(i, _)| *i).find(|i| *i != graphics_family.0);
+                let separate_compute_family = compute_families.into_iter().map(|(i, _)| i).find(|i| *i != graphics_family.0);
                 if let Some(separate_compute_family) = separate_compute_family {
                     return Some((p.clone(), vec![QueueCreateInfo {
                         queue_family_index: graphics_family.0,

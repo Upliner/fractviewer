@@ -114,8 +114,7 @@ impl Worker {
 
             // Find tiles that need computing
             let camera = data.camera.lock().unwrap();
-            let (vp_left, vp_right, vp_bottom, vp_top) = camera.viewport(w, h);
-            let pixel_scale = camera.pixel_scale(w, h);
+            let (vp_left, vp_right, vp_bottom, vp_top, pixel_scale) = camera.viewport(w, h);
             drop(camera);
             let tile_coord = data.quadtree.lock().unwrap().next_tile(vp_left, vp_right, vp_bottom, vp_top, pixel_scale);
             if let Some(tile_coord) = tile_coord {
@@ -124,7 +123,9 @@ impl Worker {
                     tile.clone(),
                     tile_coord,
                 );
-                data.quadtree.lock().unwrap().insert(tile_coord, tile);
+                if !data.quadtree.lock().unwrap().insert(tile_coord, Some(tile)) {
+                    eprintln!("Failed to insert tile to location {:?}", tile_coord);
+                }
                 tile_count += 1;
                 data.window.request_redraw();
             } else {
@@ -196,7 +197,7 @@ impl AppInternal {
         }
 
         let mut camera = self.camera();
-        let (vp_left, vp_right, vp_bottom, vp_top) = camera.viewport(w, h);
+        let (vp_left, vp_right, vp_bottom, vp_top, pixel_scale) = camera.viewport(w, h);
         // Update camera zoom if mouse is held
         if self.left_mouse_down || self.right_mouse_down {
             let direction = if self.left_mouse_down { 1.0 } else { -1.0 };
@@ -214,7 +215,7 @@ impl AppInternal {
 
 
         // Collect visible tiles for rendering (includes newly computed ones)
-        let visible = self.quadtree().get_visible_tiles(vp_left, vp_right, vp_bottom, vp_top);
+        let visible = self.quadtree().get_visible_tiles(vp_left, vp_right, vp_bottom, vp_top, pixel_scale);
 
         let viewport = Viewport {
             offset: [0.0, 0.0],
