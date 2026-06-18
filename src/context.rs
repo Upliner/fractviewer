@@ -1,21 +1,10 @@
 use std::sync::Arc;
 use vulkano::{
-    command_buffer::allocator::StandardCommandBufferAllocator,
-    descriptor_set::allocator::StandardDescriptorSetAllocator,
-    device::{
-        physical::PhysicalDeviceType, Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures,
-        Queue, QueueCreateInfo, QueueFlags,
-    },
-    format::Format,
-    image::{view::ImageView, Image, ImageUsage},
-    instance::{Instance, InstanceCreateFlags, InstanceCreateInfo},
-    memory::allocator::StandardMemoryAllocator,
-    render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass},
-    swapchain::{
+    Validated, VulkanError, VulkanLibrary, command_buffer::allocator::StandardCommandBufferAllocator, descriptor_set::allocator::StandardDescriptorSetAllocator, device::{
+        Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo, QueueFlags, physical::PhysicalDeviceType
+    }, format::Format, image::{Image, ImageCreateInfo, ImageFormatInfo, ImageLayout, ImageTiling, ImageType, ImageUsage, SampleCount, view::ImageView}, instance::{Instance, InstanceCreateFlags, InstanceCreateInfo}, memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator}, render_pass::{AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp, Framebuffer, FramebufferCreateInfo, RenderPass, RenderPassCreateInfo, Subpass, SubpassDescription}, swapchain::{
         self, Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
-    },
-    sync::{self, GpuFuture},
-    Validated, VulkanError, VulkanLibrary,
+    }, sync::{self, GpuFuture}
 };
 use winit::window::Window;
 
@@ -42,6 +31,8 @@ pub struct VulkanContext {
     pub surface: Arc<Surface>,
     pub swapchain: Arc<Swapchain>,
     pub swapchain_images: Vec<Arc<Image>>,
+    pub sample_count: SampleCount,
+    pub msaa_images: Vec<Arc<Image>>,
     pub render_pass: Arc<RenderPass>,
     pub framebuffers: Vec<Arc<Framebuffer>>,
     pub memory_allocator: Arc<StandardMemoryAllocator>,
@@ -141,6 +132,7 @@ impl VulkanContext {
                 enabled_features: DeviceFeatures {
                     shader_float64: true,
                     shader_storage_image_extended_formats: true,
+                    sample_rate_shading: true,
                     ..DeviceFeatures::empty()
                 },
                 ..Default::default()
@@ -151,25 +143,30 @@ impl VulkanContext {
         let (swapchain, swapchain_images) =
             Self::create_swapchain(&device, &surface, &window, None);
 
-        let render_pass = vulkano::single_pass_renderpass!(
-            device.clone(),
-            attachments: {
-                color: {
-                    format: swapchain.image_format(),
-                    samples: 1,
-                    load_op: Clear,
-                    store_op: Store,
-                },
-            },
-            pass: {
-                color: [color],
-                depth_stencil: {},
-            },
-        )
-        .unwrap();
+        let sample_count = Self::max_sample_count(&device, swapchain.image_format());
+        eprintln!("Using MSAA sample count: {}", u32::from(sample_count));
 
-        let framebuffers = Self::create_framebuffers(&swapchain_images, &render_pass);
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
+        let msaa_images = if u32::from(sample_count) > 1 {
+            Self::create_msaa_images(
+                &memory_allocator,
+                swapchain.image_extent(),
+                swapchain.image_format(),
+                sample_count,
+                swapchain_images.len(),
+            )
+        } else {
+            Vec::new()
+        };
+
+        let render_pass = Self::create_render_pass(&device, &swapchain, sample_count);
+
+        let framebuffers = Self::create_framebuffers(
+            &msaa_images,
+            &swapchain_images,
+            &render_pass,
+            sample_count,
+        );
         let previous_frame_end = Some(sync::now(device.clone()).boxed());
         let graphics_queue = queues.next().expect("Vulkan queue was not created as expected");
         let compute_queue = queues.next().unwrap_or(graphics_queue.clone());
@@ -178,6 +175,8 @@ impl VulkanContext {
             surface,
             swapchain,
             swapchain_images,
+            sample_count,
+            msaa_images,
             render_pass,
             framebuffers,
             memory_allocator,
@@ -244,24 +243,158 @@ impl VulkanContext {
         }
     }
 
-    fn create_framebuffers(
-        images: &[Arc<Image>],
-        render_pass: &Arc<RenderPass>,
-    ) -> Vec<Arc<Framebuffer>> {
-        images
-            .iter()
-            .map(|image| {
-                let view = ImageView::new_default(image.clone()).unwrap();
-                Framebuffer::new(
-                    render_pass.clone(),
-                    FramebufferCreateInfo {
-                        attachments: vec![view],
+    fn max_sample_count(device: &Arc<Device>, format: Format) -> SampleCount {
+        device
+            .physical_device()
+            .image_format_properties(ImageFormatInfo {
+                format,
+                image_type: ImageType::Dim2d,
+                tiling: ImageTiling::Optimal,
+                usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
+                ..Default::default()
+            })
+            .unwrap()
+            .map(|properties| properties.sample_counts.max_count())
+            .unwrap_or(SampleCount::Sample1)
+    }
+
+    fn create_msaa_images(
+        memory_allocator: &Arc<StandardMemoryAllocator>,
+        extent: [u32; 2],
+        format: Format,
+        sample_count: SampleCount,
+        count: usize,
+    ) -> Vec<Arc<Image>> {
+        let extent = [extent[0], extent[1], 1];
+        (0..count)
+            .map(|_| {
+                Image::new(
+                    memory_allocator.clone(),
+                    ImageCreateInfo {
+                        image_type: ImageType::Dim2d,
+                        format,
+                        extent,
+                        samples: sample_count,
+                        usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
+                        ..Default::default()
+                    },
+                    AllocationCreateInfo {
+                        memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
                         ..Default::default()
                     },
                 )
                 .unwrap()
             })
             .collect()
+    }
+
+    fn create_render_pass(
+        device: &Arc<Device>,
+        swapchain: &Arc<Swapchain>,
+        sample_count: SampleCount,
+    ) -> Arc<RenderPass> {
+        let format = swapchain.image_format();
+        if u32::from(sample_count) > 1 {
+            RenderPass::new(
+                device.clone(),
+                RenderPassCreateInfo {
+                    attachments: vec![
+                        AttachmentDescription {
+                            format,
+                            samples: sample_count,
+                            load_op: AttachmentLoadOp::Clear,
+                            store_op: AttachmentStoreOp::DontCare,
+                            initial_layout: ImageLayout::Undefined,
+                            final_layout: ImageLayout::ColorAttachmentOptimal,
+                            ..Default::default()
+                        },
+                        AttachmentDescription {
+                            format,
+                            samples: SampleCount::Sample1,
+                            load_op: AttachmentLoadOp::DontCare,
+                            store_op: AttachmentStoreOp::Store,
+                            initial_layout: ImageLayout::Undefined,
+                            final_layout: ImageLayout::PresentSrc,
+                            ..Default::default()
+                        },
+                    ],
+                    subpasses: vec![SubpassDescription {
+                        color_attachments: vec![Some(AttachmentReference {
+                            attachment: 0,
+                            layout: ImageLayout::ColorAttachmentOptimal,
+                            ..Default::default()
+                        })],
+                        color_resolve_attachments: vec![Some(AttachmentReference {
+                            attachment: 1,
+                            layout: ImageLayout::ColorAttachmentOptimal,
+                            ..Default::default()
+                        })],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        } else {
+            vulkano::single_pass_renderpass!(
+                device.clone(),
+                attachments: {
+                    color: {
+                        format: format,
+                        samples: 1,
+                        load_op: Clear,
+                        store_op: Store,
+                        final_layout: ImageLayout::PresentSrc,
+                    },
+                },
+                pass: {
+                    color: [color],
+                    depth_stencil: {},
+                },
+            )
+            .unwrap()
+        }
+    }
+
+    fn create_framebuffers(
+        msaa_images: &[Arc<Image>],
+        swapchain_images: &[Arc<Image>],
+        render_pass: &Arc<RenderPass>,
+        sample_count: SampleCount,
+    ) -> Vec<Arc<Framebuffer>> {
+        if u32::from(sample_count) > 1 {
+            msaa_images
+                .iter()
+                .zip(swapchain_images.iter())
+                .map(|(msaa_image, swapchain_image)| {
+                    let msaa_view = ImageView::new_default(msaa_image.clone()).unwrap();
+                    let swapchain_view = ImageView::new_default(swapchain_image.clone()).unwrap();
+                    Framebuffer::new(
+                        render_pass.clone(),
+                        FramebufferCreateInfo {
+                            attachments: vec![msaa_view, swapchain_view],
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+                })
+                .collect()
+        } else {
+            swapchain_images
+                .iter()
+                .map(|image| {
+                    let view = ImageView::new_default(image.clone()).unwrap();
+                    Framebuffer::new(
+                        render_pass.clone(),
+                        FramebufferCreateInfo {
+                            attachments: vec![view],
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+                })
+                .collect()
+        }
     }
 
     pub fn recreate_swapchain_if_needed(&mut self, window: &Window) {
@@ -280,7 +413,21 @@ impl VulkanContext {
         );
         self.swapchain = new_swapchain;
         self.swapchain_images = new_images;
-        self.framebuffers = Self::create_framebuffers(&self.swapchain_images, &self.render_pass);
+        if u32::from(self.sample_count) > 1 {
+            self.msaa_images = Self::create_msaa_images(
+                &self.memory_allocator,
+                self.swapchain.image_extent(),
+                self.swapchain.image_format(),
+                self.sample_count,
+                self.swapchain_images.len(),
+            );
+        }
+        self.framebuffers = Self::create_framebuffers(
+            &self.msaa_images,
+            &self.swapchain_images,
+            &self.render_pass,
+            self.sample_count,
+        );
         self.recreate_swapchain = false;
     }
 

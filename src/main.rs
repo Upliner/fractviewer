@@ -101,7 +101,7 @@ impl Worker {
                 series_start = true;
                 if tile_count > 0 {
                     let elapsed = series_start_time.elapsed();
-                    eprintln!("Computed {} tiles in {:?} ({} tiles/s)", tile_count, elapsed, tile_count as f64 / elapsed.as_secs_f64());
+                    eprintln!("Computed {} tiles in {:?} ({:.2} tiles/s)", tile_count, elapsed, tile_count as f64 / elapsed.as_secs_f64());
                     tile_count = 0;
                 }
                 data.go_idle();
@@ -168,7 +168,7 @@ impl AppInternal {
         let attrs = WindowAttributes::default().with_title("Fractal Viewer - Mandelbrot");
         let window = Arc::new(event_loop.create_window(attrs).expect("Failed to create window"));
         let ctx = VulkanContext::new(window.clone());
-        let renderer = Renderer::new(&ctx.data.device, ctx.subpass());
+        let renderer = Renderer::new(&ctx.data.device, ctx.subpass(), ctx.sample_count);
         let worker = Worker::new(ctx.data.clone(), window);
         AppInternal {
             ctx,
@@ -197,7 +197,8 @@ impl AppInternal {
         }
 
         let mut camera = self.camera();
-        let (vp_left, vp_right, vp_bottom, vp_top, pixel_scale) = camera.viewport(w, h);
+        let (vp_left, vp_right, vp_bottom, vp_top, mut pixel_scale) = camera.viewport(w, h);
+        pixel_scale /= 2.0;
         // Update camera zoom if mouse is held
         if self.left_mouse_down || self.right_mouse_down {
             let direction = if self.left_mouse_down { 1.0 } else { -1.0 };
@@ -246,7 +247,6 @@ impl AppInternal {
             .unwrap()
             .boxed();
 
-        //eprintln!("presenting...");
         self.ctx.present(after_exec, image_index);
         eprintln!("Render time: {:?}", start.elapsed());
         // Request continuous redraw if zooming or tiles still needed

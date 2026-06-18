@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage},
+    image::SampleCount,
     command_buffer::{
         AutoCommandBufferBuilder, PrimaryAutoCommandBuffer,
         RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo,
@@ -93,12 +94,14 @@ void main() {
 pub struct Renderer {
     pipeline: Arc<GraphicsPipeline>,
     tile_sampler: Arc<Sampler>,
+    sample_count: SampleCount,
 }
 
 impl Renderer {
     pub fn new(
         device: &Arc<Device>,
         subpass: Subpass,
+        sample_count: SampleCount,
     ) -> Self {
         let vs = vertex_shader::load(device.clone()).unwrap();
         let fs = fragment_shader::load(device.clone()).unwrap();
@@ -131,7 +134,11 @@ impl Renderer {
                     input_assembly_state: Some(InputAssemblyState::default()),
                     viewport_state: Some(ViewportState::default()),
                     rasterization_state: Some(RasterizationState::default()),
-                    multisample_state: Some(MultisampleState::default()),
+                    multisample_state: Some(MultisampleState {
+                        rasterization_samples: sample_count,
+                        sample_shading: Some(1.0),
+                        ..Default::default()
+                    }),
                     color_blend_state: Some(ColorBlendState::with_attachment_states(
                         subpass.num_color_attachments(),
                         ColorBlendAttachmentState::default(),
@@ -148,6 +155,7 @@ impl Renderer {
                     address_mode: [SamplerAddressMode::ClampToEdge; 3],
                     ..Default::default()
                 }).expect("failed to create tile sampler"),
+            sample_count,
         }
     }
 
@@ -165,10 +173,15 @@ impl Renderer {
         vp_bottom: f64,
         vp_top: f64,
     ) {
+        let clear_values = if u32::from(self.sample_count) > 1 {
+            vec![Some([0.0, 0.0, 0.0, 1.0].into()), None]
+        } else {
+            vec![Some([0.0, 0.0, 0.0, 1.0].into())]
+        };
         builder
             .begin_render_pass(
                 RenderPassBeginInfo {
-                    clear_values: vec![Some([0.0, 0.0, 0.0, 1.0].into())],
+                    clear_values,
                     ..RenderPassBeginInfo::framebuffer(framebuffer)
                 },
                 SubpassBeginInfo {
