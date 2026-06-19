@@ -204,7 +204,7 @@ impl VulkanContext {
             .find(|(f, _)| {
                 matches!(
                     f,
-                    Format::B8G8R8A8_SRGB | Format::R8G8B8A8_SRGB | Format::B8G8R8A8_UNORM
+                    /*Format::B8G8R8A8_SRGB | Format::R8G8B8A8_SRGB |*/ Format::B8G8R8A8_UNORM
                 )
             })
             .unwrap_or_else(|| {

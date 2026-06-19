@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
-use smallvec::SmallVec;
 use vulkano::{
     device::Device,
     format::Format,
@@ -241,6 +240,10 @@ impl QuadTreeNode {
         }
     }
 
+    fn children_iter(&self, coord: TileCoord) -> impl Iterator<Item = (TileCoord, &Option<Box<QuadTreeNode>>)> {
+        coord.children().into_iter().zip(self.children.iter())
+    }
+
     fn collect_visible(
         &self,
         coord: TileCoord,
@@ -261,7 +264,7 @@ impl QuadTreeNode {
         if target_depth {
             return;
         }
-        for (child_coord, child) in coord.children().into_iter().zip(self.children.iter()) {
+        for (child_coord, child) in self.children_iter(coord) {
             if let Some(child) = child {
                 child.collect_visible(child_coord, vp_left, vp_right, vp_bottom, vp_top, target_pixel_scale, result);
             }
@@ -277,24 +280,31 @@ impl QuadTreeNode {
         vp_top: f64,
         target_pixel_scale: f64,
     ) -> Option<TileCoord> {
-        let children = coord.children().into_iter().zip(self.children.iter())
-            /* */.filter(|(child_coord, _)| child_coord.overlaps(vp_left, vp_right, vp_bottom, vp_top)).collect::<SmallVec<[_; 4]>>();
-        for (child_coord, child) in &children {
-            if child.is_none() {
-                return Some(child_coord.clone());
+        let mut result: Option<TileCoord> = None;
+        let go_deeper = coord.level < MAX_DEPTH && coord.pixel_scale() > target_pixel_scale;
+        for (child_coord, child) in self.children_iter(coord) {
+            if !child_coord.overlaps(vp_left, vp_right, vp_bottom, vp_top) {
+                continue;
             }
-        }
-        if coord.level >= MAX_DEPTH || coord.pixel_scale() <= target_pixel_scale {
-            return None;
-        }
-        for (child_coord, child) in children {
-            if let Some(child) = child {
-                if let Some(result) = child.next_tile(child_coord, vp_left, vp_right, vp_bottom, vp_top, target_pixel_scale) {
-                    return Some(result);
+            match child {
+                None => return Some(child_coord),
+                Some(child) => {
+                    if go_deeper {
+                        if let Some(deeper_tile) = child.next_tile(child_coord, vp_left, vp_right, vp_bottom, vp_top, target_pixel_scale) {
+                            match result {
+                                None => result = Some(deeper_tile),
+                                Some(result2) => {
+                                    if deeper_tile.level < result2.level {
+                                        result = Some(deeper_tile);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
-        None
+        result
     }
 }
 pub struct QuadTree {
