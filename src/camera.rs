@@ -9,6 +9,18 @@ pub struct Camera {
     pub scale: f64,
     last_update: Instant,
 }
+pub struct Viewport {
+    pub left: f64,
+    pub right: f64,
+    pub bottom: f64,
+    pub top: f64,
+    pub pixel_scale: f64, // Complex-plane units per pixel at current zoom/window size.
+}
+impl Viewport {
+    pub fn scale_pix(self, factor: f64) -> Viewport {
+        Viewport {pixel_scale: self.pixel_scale * factor, ..self}
+    }
+}
 
 impl Camera {
     pub fn new() -> Self {
@@ -68,16 +80,16 @@ impl Camera {
     }
 
     /// Returns (left, right, bottom, top) in complex plane coordinates.
-    pub fn viewport(&self, window_width: u32, window_height: u32) -> (f64, f64, f64, f64, f64) {
+    pub fn viewport(&self, window_width: u32, window_height: u32) -> Viewport {
         let aspect = window_width as f64 / window_height as f64;
         let half_w = self.scale * aspect;
         let half_h = self.scale;
-        (
-            self.center_x - half_w,
-            self.center_x + half_w,
-            self.center_y - half_h,
-            self.center_y + half_h,
-            (self.scale * 2.0) / window_height as f64, // Complex-plane units per pixel at current zoom/window size.
-        )
+        Viewport {
+            left: self.center_x - half_w,
+            right: self.center_x + half_w,
+            bottom: self.center_y - half_h,
+            top: self.center_y + half_h,
+            pixel_scale: self.scale * 2.0 / window_height as f64,
+        }
     }
 }

@@ -113,10 +113,7 @@ impl Worker {
             }
 
             // Find tiles that need computing
-            let camera = data.camera.lock().unwrap();
-            let (vp_left, vp_right, vp_bottom, vp_top, pixel_scale) = camera.viewport(w, h);
-            drop(camera);
-            let tile_coord = data.quadtree.lock().unwrap().next_tile(vp_left, vp_right, vp_bottom, vp_top, pixel_scale);
+            let tile_coord = data.quadtree.lock().unwrap().next_tile(data.camera.lock().unwrap().viewport(w, h));
             if let Some(tile_coord) = tile_coord {
                 let tile = pool.allocate();
                 compute.compute_tile(
@@ -197,8 +194,7 @@ impl AppInternal {
         }
 
         let mut camera = self.camera();
-        let (vp_left, vp_right, vp_bottom, vp_top, mut pixel_scale) = camera.viewport(w, h);
-        pixel_scale /= 2.0;
+        let vp = camera.viewport(w, h).scale_pix(0.5);
         // Update camera zoom if mouse is held
         if self.left_mouse_down || self.right_mouse_down {
             let direction = if self.left_mouse_down { 1.0 } else { -1.0 };
@@ -216,7 +212,7 @@ impl AppInternal {
 
 
         // Collect visible tiles for rendering (includes newly computed ones)
-        let visible = self.quadtree().get_visible_tiles(vp_left, vp_right, vp_bottom, vp_top, pixel_scale);
+        let visible = self.quadtree().get_visible_tiles(&vp);
 
         let viewport = Viewport {
             offset: [0.0, 0.0],
@@ -232,10 +228,7 @@ impl AppInternal {
             &vkdata.descriptor_set_allocator,
             &self.ctx.memory_allocator,
             &visible,
-            vp_left,
-            vp_right,
-            vp_bottom,
-            vp_top,
+            &vp,
         );
 
         let cb = builder.build().unwrap();

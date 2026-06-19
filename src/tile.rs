@@ -8,6 +8,8 @@ use vulkano::{
     memory::{DeviceMemory, MemoryAllocateInfo, MemoryPropertyFlags, ResourceMemory, allocator::align_up},
 };
 
+use crate::camera::Viewport;
+
 pub const TILE_SIZE: u32 = 256;
 pub const ARENA_SIZE: u32 = 1024;
 
@@ -83,10 +85,10 @@ impl TileCoord {
     }
 
     /// Does this tile's region overlap the given viewport?
-    pub fn overlaps(&self, vp_left: f64, vp_right: f64, vp_bottom: f64, vp_top: f64) -> bool {
+    pub fn overlaps(&self, vp: &Viewport) -> bool {
         let (ox, oy) = self.origin();
         let ext = self.tile_extent();
-        ox < vp_right && ox + ext > vp_left && oy < vp_top && oy + ext > vp_bottom
+        ox < vp.right && ox + ext > vp.left && oy < vp.top && oy + ext > vp.bottom
     }
 }
 
@@ -240,57 +242,34 @@ impl QuadTreeNode {
         }
     }
 
-    fn children_iter(&self, coord: TileCoord) -> impl Iterator<Item = (TileCoord, &Option<Box<QuadTreeNode>>)> {
-        coord.children().into_iter().zip(self.children.iter())
+    fn children_iter(&self, coord: TileCoord, vp: &Viewport) -> impl Iterator<Item = (TileCoord, &Option<Box<QuadTreeNode>>)> {
+        coord.children().into_iter().zip(self.children.iter()).filter(|(child_coord, _)| child_coord.overlaps(vp))
     }
 
-    fn collect_visible(
-        &self,
-        coord: TileCoord,
-        vp_left: f64,
-        vp_right: f64,
-        vp_bottom: f64,
-        vp_top: f64,
-        target_pixel_scale: f64,
-        result: &mut Vec<(TileCoord, Arc<ImageView>)>,
-    ) {
-        if !coord.overlaps(vp_left, vp_right, vp_bottom, vp_top) {
-            return;
-        }
-        let target_depth = coord.pixel_scale() <= target_pixel_scale || coord.level >= MAX_DEPTH;
+    fn collect_visible(&self, coord: TileCoord, vp: &Viewport, result: &mut Vec<(TileCoord, Arc<ImageView>)>) {
+        let target_depth = coord.pixel_scale() <= vp.pixel_scale || coord.level >= MAX_DEPTH;
         if target_depth || self.children.iter().any(|c| c.is_none()) {
             result.push((coord.clone(), self.item.clone()));
         }
         if target_depth {
             return;
         }
-        for (child_coord, child) in self.children_iter(coord) {
+        for (child_coord, child) in self.children_iter(coord, vp) {
             if let Some(child) = child {
-                child.collect_visible(child_coord, vp_left, vp_right, vp_bottom, vp_top, target_pixel_scale, result);
+                child.collect_visible(child_coord, vp, result);
             }
         }
     }
 
-    fn next_tile(
-        &self,
-        coord: TileCoord,
-        vp_left: f64,
-        vp_right: f64,
-        vp_bottom: f64,
-        vp_top: f64,
-        target_pixel_scale: f64,
-    ) -> Option<TileCoord> {
+    fn next_tile(&self, coord: TileCoord, vp: &Viewport) -> Option<TileCoord> {
         let mut result: Option<TileCoord> = None;
-        let go_deeper = coord.level < MAX_DEPTH && coord.pixel_scale() > target_pixel_scale;
-        for (child_coord, child) in self.children_iter(coord) {
-            if !child_coord.overlaps(vp_left, vp_right, vp_bottom, vp_top) {
-                continue;
-            }
+        let go_deeper = coord.level < MAX_DEPTH && coord.pixel_scale() > vp.pixel_scale;
+        for (child_coord, child) in self.children_iter(coord, vp) {
             match child {
                 None => return Some(child_coord),
                 Some(child) => {
                     if go_deeper {
-                        if let Some(deeper_tile) = child.next_tile(child_coord, vp_left, vp_right, vp_bottom, vp_top, target_pixel_scale) {
+                        if let Some(deeper_tile) = child.next_tile(child_coord, vp) {
                             match result {
                                 None => result = Some(deeper_tile),
                                 Some(result2) => {
@@ -327,48 +306,20 @@ impl QuadTree {
     }
     /// Find visible tiles at the best available resolution for the given viewport.
     /// Returns list of (TileCoord, TileSlot, screen_rect) for rendering.
-    pub fn get_visible_tiles(
-        &self,
-        vp_left: f64,
-        vp_right: f64,
-        vp_bottom: f64,
-        vp_top: f64,
-        target_pixel_scale: f64,
-    ) -> Vec<(TileCoord, Arc<ImageView>)> {
+    pub fn get_visible_tiles(&self, vp: &Viewport) -> Vec<(TileCoord, Arc<ImageView>)> {
         let mut result = Vec::new();
         if let Some(root) = &self.root {
-            root.collect_visible(
-                TileCoord::root(),
-                vp_left,
-                vp_right,
-                vp_bottom,
-                vp_top,
-                target_pixel_scale,
-                &mut result,
-            );
+            root.collect_visible(TileCoord::root(), vp, &mut result);
         }
         result
     }
     /// Find next tiles that need to be computed to improve resolution for the viewport.
     /// Returns coords not yet in the tree that would refine visible areas.
-    pub fn next_tile(
-        &self,
-        vp_left: f64,
-        vp_right: f64,
-        vp_bottom: f64,
-        vp_top: f64,
-        target_pixel_scale: f64,
-    ) -> Option<TileCoord> {
+    pub fn next_tile(&self, vp: Viewport) -> Option<TileCoord> {
         let root_coord = TileCoord::root();
         match &self.root {
             None => Some(root_coord),
-            Some(root) => root.next_tile(
-                root_coord,
-                vp_left,
-                vp_right,
-                vp_bottom,
-                vp_top,
-                target_pixel_scale * 2.0),
+            Some(root) => root.next_tile(root_coord, &vp.scale_pix(2.0)),
         }
     }
 }

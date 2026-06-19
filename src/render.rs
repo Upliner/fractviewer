@@ -33,6 +33,7 @@ use vulkano::{
 };
 
 use crate::tile::{TILE_SIZE, TileCoord};
+use crate::camera::Viewport as CameraViewport;
 
 #[derive(vulkano::buffer::BufferContents, Vertex, Clone, Copy)]
 #[repr(C)]
@@ -168,10 +169,7 @@ impl Renderer {
         descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
         memory_allocator: &Arc<StandardMemoryAllocator>,
         visible_tiles: &[(TileCoord, Arc<ImageView>)],
-        vp_left: f64,
-        vp_right: f64,
-        vp_bottom: f64,
-        vp_top: f64,
+        vp: &CameraViewport,
     ) {
         let clear_values = if u32::from(self.sample_count) > 1 {
             vec![Some([0.0, 0.0, 0.0, 1.0].into()), None]
@@ -195,8 +193,8 @@ impl Renderer {
             .bind_pipeline_graphics(self.pipeline.clone())
             .unwrap();
 
-        let vp_w = vp_right - vp_left;
-        let vp_h = vp_top - vp_bottom;
+        let vp_w = vp.right - vp.left;
+        let vp_h = vp.top - vp.bottom;
 
         let uv1 = 0.5 / TILE_SIZE as f32;
         let uv2 = 1.0 - uv1;
@@ -207,10 +205,10 @@ impl Renderer {
             let tile_ext = coord.tile_extent();
 
             // Screen-space NDC for this tile
-            let sx0 = ((tile_ox - vp_left) / vp_w * 2.0 - 1.0) as f32;
-            let sy0 = ((tile_oy - vp_bottom) / vp_h * 2.0 - 1.0) as f32;
-            let sx1 = ((tile_ox + tile_ext - vp_left) / vp_w * 2.0 - 1.0) as f32;
-            let sy1 = ((tile_oy + tile_ext - vp_bottom) / vp_h * 2.0 - 1.0) as f32;
+            let sx0 = ((tile_ox - vp.left) / vp_w * 2.0 - 1.0) as f32;
+            let sy0 = ((tile_oy - vp.bottom) / vp_h * 2.0 - 1.0) as f32;
+            let sx1 = ((tile_ox + tile_ext - vp.left) / vp_w * 2.0 - 1.0) as f32;
+            let sy1 = ((tile_oy + tile_ext - vp.bottom) / vp_h * 2.0 - 1.0) as f32;
 
             let vertices = [
                 TileVertex { position: [sx0, sy0], uv: [uv1, uv1] },
