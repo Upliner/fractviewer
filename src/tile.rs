@@ -267,20 +267,16 @@ impl QuadTreeNode {
         for (child_coord, child) in self.children_iter(coord, vp) {
             match child {
                 None => return Some(child_coord),
-                Some(child) => {
-                    if go_deeper {
-                        if let Some(deeper_tile) = child.next_tile(child_coord, vp) {
-                            match result {
-                                None => result = Some(deeper_tile),
-                                Some(result2) => {
-                                    if deeper_tile.level < result2.level {
-                                        result = Some(deeper_tile);
-                                    }
-                                }
-                            }
+                Some(child) if go_deeper => {
+                    if let Some(deeper_tile) = child.next_tile(child_coord, vp) {
+                        result = match result {
+                            None => Some(deeper_tile),
+                            Some(tc) if deeper_tile.level < tc.level => Some(deeper_tile),
+                            otc => otc,
                         }
                     }
                 }
+                _ => (),
             }
         }
         result
