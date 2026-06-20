@@ -64,6 +64,7 @@ impl VulkanContext {
         };
 
         const TARGET_COMPUTE_CNT : usize = 2;
+        const COMPUTE_PRIO: f32 = 0.5 / TARGET_COMPUTE_CNT as f32;
         let (physical_device, queue_create_infos) = instance
             .enumerate_physical_devices()
             .unwrap()
@@ -92,7 +93,7 @@ impl VulkanContext {
                     let cnt = min(q.queue_count as usize, TARGET_COMPUTE_CNT - compute_cnt.get());
                     queues.push(QueueCreateInfo {
                         queue_family_index: i,
-                        queues: std::iter::repeat(0.5).take(cnt).collect(),
+                        queues: std::iter::repeat(COMPUTE_PRIO).take(cnt).collect(),
                         ..Default::default()
                     });
                     compute_cnt.update(|c| c + cnt);
@@ -121,7 +122,7 @@ impl VulkanContext {
                     let cnt = min((TARGET_COMPUTE_CNT-compute_cnt.get()) as i64, graphics_family.1.queue_count as i64-1);
                     if cnt > 0 {
                         for _ in 0..(cnt as usize) {
-                            gqueues.push(0.5);
+                            gqueues.push(COMPUTE_PRIO);
                         }
                     }
                     gqueues.push(1.0);

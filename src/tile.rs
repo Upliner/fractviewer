@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
-use std::sync::Arc;
+use std::{num::NonZero, sync::Arc};
 use vulkano::{
-    device::Device,
+    device::{Device, DeviceOwned},
     format::Format,
     image::{ImageCreateInfo, ImageType, ImageUsage, sys::RawImage, view::ImageView},
     memory::{DeviceMemory, MemoryAllocateInfo, MemoryPropertyFlags, ResourceMemory, allocator::align_up},
@@ -11,7 +11,7 @@ use vulkano::{
 use crate::{camera::Viewport, tile::ChildNode::Present};
 
 pub const TILE_SIZE: u32 = 256;
-pub const ARENA_SIZE: u32 = 1024;
+pub const ARENA_SIZE: NonZero<u32> = NonZero::new(1024).unwrap();
 
 /// Root tile covers [-2.5, 1.5] x [-2.0, 2.0] in complex plane.
 pub const ROOT_LEFT: f64 = -2.5;
@@ -92,9 +92,11 @@ impl TileCoord {
     }
 }
 
-pub struct TileArena {
-    pub items: Vec<Arc<ImageView>>,
-    free_slots: Vec<u32>,
+struct TileArena {
+    dm: Arc<DeviceMemory>,
+    mem_sz: u64,
+    tile_sz: u32,
+    ptr: u32, cnt: u32,
 }
 fn find_memory_type(dev: &Device, memory_type_bits : u32) -> Option<u32> {
     let types = &dev.physical_device().memory_properties().memory_types;
@@ -110,101 +112,80 @@ fn find_memory_type(dev: &Device, memory_type_bits : u32) -> Option<u32> {
     }
     None
 }
+fn make_raw(dev: &Arc<Device>, size: u32) -> RawImage {
+    let ici = ImageCreateInfo {
+        image_type: ImageType::Dim2d,
+        format: Format::R16_UNORM,
+        extent: [size, size, 1],
+        usage: ImageUsage::STORAGE | ImageUsage::SAMPLED,
+        ..Default::default()
+    };
+    RawImage::new(dev.clone(),ici.clone()).expect("failed to create tile image")
+}
 impl TileArena {
-    pub fn new_default(dev: &Arc<Device>) -> Self {
+    pub fn new_default(dev: &Arc<Device>) -> (Self, Arc<ImageView>) {
         Self::new(dev, TILE_SIZE, ARENA_SIZE)
     }
-    pub fn new(dev: &Arc<Device>, size: u32, count: u32) -> Self {
-        let ici = ImageCreateInfo {
-            image_type: ImageType::Dim2d,
-            format: Format::R16_UNORM,
-            extent: [size, size, 1],
-            usage: ImageUsage::STORAGE | ImageUsage::SAMPLED,
-            ..Default::default()
-        };
-        let make_raw = || { RawImage::new(dev.clone(),ici.clone()).expect("failed to create tile image") };
-        let raw_image = make_raw();
+    fn make_iv(&mut self, ri: RawImage) -> Arc<ImageView> {
+        let iv = ImageView::new_default(Arc::new(ri
+            .bind_memory(std::iter::once(unsafe { ResourceMemory::from_device_memory_unchecked(
+                self.dm.clone(), self.ptr as u64 * self.mem_sz, self.mem_sz) }))
+            .map_err(|e| e.0)
+            .expect("failed to bind memory"))).expect("failed to create image view");
+        self.ptr += 1;
+        iv
+    }
+    pub fn new(dev: &Arc<Device>, tile_sz: u32, count: NonZero<u32>) -> (Self, Arc<ImageView>) {
+        let count = count.get();
+        let raw_image = make_raw(dev, tile_sz);
         let req = raw_image.memory_requirements().first().expect("failed to get memory requirements");
         let l = req.layout;
-        let sz = align_up(l.size(), l.alignment());
+        let mem_sz = align_up(l.size(), l.alignment());
 
-        let dm = Arc::new(DeviceMemory::allocate(dev.clone(), MemoryAllocateInfo{
-            allocation_size: sz * count as u64,
-            memory_type_index: find_memory_type(dev, req.memory_type_bits).expect("failed to find memory type"),
-            ..Default::default()
-        }).expect("failed to allocate tile memory"));
-
-        let make_iv = |raw_image: RawImage, offset: u64| {
-            ImageView::new_default(Arc::new(raw_image
-                .bind_memory(std::iter::once(unsafe { ResourceMemory::from_device_memory_unchecked(dm.clone(), offset, l.size()) }))
-                .map_err(|e| e.0)
-                .expect("failed to bind memory"))).expect("failed to create image view")
+        let mut result = TileArena {
+            dm: Arc::new(DeviceMemory::allocate(dev.clone(), MemoryAllocateInfo{
+                allocation_size: mem_sz * count as u64,
+                memory_type_index: find_memory_type(dev, req.memory_type_bits).expect("failed to find memory type"),
+                ..Default::default()
+            }).expect("failed to allocate tile memory")),
+            mem_sz, tile_sz, ptr: 0, cnt: count,
         };
-
-        let mut items: Vec<Arc<ImageView>> = Vec::with_capacity(count as usize);
-        items.push(make_iv(raw_image, 0));
-
-        for i in 1..count {
-            items.push(make_iv(make_raw(), i as u64 * sz as u64));
-        }
-
-        TileArena {items, free_slots: (0..count).collect()}
+        let iv = result.make_iv(raw_image);
+        (result, iv)
     }
 
-    pub fn allocate_slot(&mut self) -> Option<Arc<ImageView>> {
-        match self.free_slots.pop() {
-            Some(index) => Some(self.items[index as usize].clone()),
-            None => None,
+    pub fn make(&mut self) -> Option<Arc<ImageView>> {
+        if self.exhausted() {
+            None
+        } else {
+            Some(self.make_iv(make_raw(self.dm.device(), self.tile_sz)))
         }
     }
 
-    pub fn free_slot(&mut self, index: u32) {
-        self.free_slots.push(index);
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.free_slots.len() >= self.items.len()
-    }
-
-    pub fn has_free_slots(&self) -> bool {
-        !self.free_slots.is_empty()
+    pub fn exhausted(&self) -> bool {
+        self.ptr >= self.cnt
     }
 }
 
 pub struct TilePool {
-    arenas: Vec<TileArena>,
+    cur_arena: Option<TileArena>,
     dev: Arc<Device>,
 }
 
 impl TilePool {
     pub fn new(dev: Arc<Device>) -> Self {
-        TilePool {
-            arenas: Vec::new(),
-            dev,
-        }
+        TilePool { cur_arena: None, dev}
     }
 
     pub fn allocate(&mut self) -> Arc<ImageView> {
-        for arena in self.arenas.iter_mut() {
-            if let Some(result) = arena.allocate_slot() {
-                return result;
+        if let Some(arena) = &mut self.cur_arena {
+            if let Some(iv) = arena.make() {
+                return iv;
             }
         }
-        eprintln!("Allocating arena {}", self.arenas.len() + 1);
-        self.arenas.push_mut(TileArena::new_default(&self.dev)).allocate_slot().unwrap()
-    }
-
-    pub fn free(&mut self, slot: &Arc<ImageView>) {
-        for arena in self.arenas.iter_mut() {
-            let index = arena.items.iter().position(|item| item == slot);
-            match index {
-                Some(index) => {
-                    arena.free_slot(index as u32);
-                    return;
-                }
-                None => continue,
-            }
-        }
+        let (new_arena, iv) = TileArena::new_default(&self.dev);
+        self.cur_arena = Some(new_arena);
+        iv
     }
 }
 
