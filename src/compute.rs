@@ -69,9 +69,9 @@ layout(push_constant) uniform PushConstants {
 
 void main() {
     ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 base = pos*size;
-    for (int y = 0; y < size; y++) {
-        for (int x = 0; x < size; x++) {
+    ivec2 base = pos*(size-1);
+    for (int y = 0; y <= size; y++) {
+        for (int x = 0; x <= size; x++) {
             if (imageLoad(in_tile, base+ivec2(x, y)).r < 1.0) {
                 imageStore(map, pos, uvec4(0));
                 return;
