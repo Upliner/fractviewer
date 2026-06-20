@@ -4,7 +4,7 @@ mod context;
 mod render;
 mod tile;
 
-use std::{ops::{Deref, DerefMut}, sync::{Arc, Condvar, Mutex}, thread, time::Instant};
+use std::{ops::{DerefMut}, sync::{Arc, Condvar, Mutex}, thread, time::Instant};
 use vulkano::{
     command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage},
     pipeline::graphics::viewport::Viewport,
@@ -88,10 +88,11 @@ impl Worker {
     }
     fn run(vk: Arc<VulkanData>, data: Arc<SharedData>) {
         let mut pool = TilePool::new(vk.device.clone());
-        let compute = ComputeEngine::new(vk.clone(), MAX_ITERATIONS);
+        let mut compute = ComputeEngine::new(vk.clone(), MAX_ITERATIONS);
         let mut series_start: bool = false;
         let mut series_start_time: Instant = Instant::now();
         let mut tile_count: u32 = 0;
+        let mut cull_count: u32 = 0;
         while data.check_state() {
             if series_start {
                 series_start = false;
@@ -101,8 +102,9 @@ impl Worker {
                 series_start = true;
                 if tile_count > 0 {
                     let elapsed = series_start_time.elapsed();
-                    eprintln!("Computed {} tiles in {:?} ({:.2} tiles/s)", tile_count, elapsed, tile_count as f64 / elapsed.as_secs_f64());
+                    eprintln!("Computed {} tiles in {:?} ({:.2} tiles/s), {} tiles culled", tile_count, elapsed, tile_count as f64 / elapsed.as_secs_f64(), cull_count);
                     tile_count = 0;
+                    cull_count = 0;
                 }
                 data.go_idle();
             };
@@ -116,11 +118,12 @@ impl Worker {
             let tile_coord = data.quadtree.lock().unwrap().next_tile(data.camera.lock().unwrap().viewport(w, h));
             if let Some(tile_coord) = tile_coord {
                 let tile = pool.allocate();
-                compute.compute_tile(
+                let blocks = compute.compute_tile(
                     tile.clone(),
                     tile_coord,
                 );
-                if !data.quadtree.lock().unwrap().insert(tile_coord, Some(tile)) {
+                blocks.iter().for_each(|block| if *block { cull_count += 1; });
+                if !data.quadtree.lock().unwrap().insert(tile_coord, Some(tile), blocks) {
                     eprintln!("Failed to insert tile to location {:?}", tile_coord);
                 }
                 tile_count += 1;
@@ -152,9 +155,6 @@ impl App {
     }
 }
 impl AppInternal {
-    fn quadtree(&self) -> impl Deref<Target = QuadTree> {
-        self.worker.data.quadtree.lock().unwrap()
-    }
     fn camera(&self) -> impl DerefMut<Target = Camera> {
         self.worker.data.camera.lock().unwrap()
     }
@@ -212,7 +212,7 @@ impl AppInternal {
 
 
         // Collect visible tiles for rendering (includes newly computed ones)
-        let visible = self.quadtree().get_visible_tiles(&vp);
+        let visible = self.worker.data.quadtree.lock().unwrap().get_visible_tiles(&vp);
 
         let viewport = Viewport {
             offset: [0.0, 0.0],
@@ -226,7 +226,7 @@ impl AppInternal {
             self.ctx.framebuffers[image_index as usize].clone(),
             viewport,
             &vkdata.descriptor_set_allocator,
-            &self.ctx.memory_allocator,
+            &self.ctx.memory_allocator.clone(),
             &visible,
             &vp,
         );

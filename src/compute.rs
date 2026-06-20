@@ -4,9 +4,9 @@ use ash::vk;
 use vulkano::{
     VulkanObject, command_buffer::{CommandBufferBeginInfo, CommandBufferLevel, CommandBufferUsage, RecordingCommandBuffer}, descriptor_set::{
         WriteDescriptorSet, layout::DescriptorSetLayout, sys::RawDescriptorSet
-    }, image::{ImageAspects, ImageLayout, ImageSubresourceRange, view::ImageView}, pipeline::{
+    }, device::Device, format::Format, image::{ImageAspect, ImageAspects, ImageCreateInfo, ImageLayout, ImageSubresourceRange, ImageTiling, ImageType, ImageUsage, sys::RawImage, view::ImageView}, memory::{DeviceMemory, MemoryAllocateInfo, MemoryMapInfo, MemoryPropertyFlags, ResourceMemory}, pipeline::{
         ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo, compute::ComputePipelineCreateInfo, layout::{PipelineDescriptorSetLayoutCreateInfo, PipelineLayoutCreateInfo}
-    }, sync::{AccessFlags, DependencyInfo, ImageMemoryBarrier, PipelineStages, QueueFamilyOwnershipTransfer, fence::{Fence, FenceCreateInfo}}
+    }, shader::ShaderModule, sync::{AccessFlags, DependencyInfo, ImageMemoryBarrier, PipelineStages, QueueFamilyOwnershipTransfer, fence::{Fence, FenceCreateInfo}}
 };
 
 use crate::context::VulkanData;
@@ -31,10 +31,8 @@ layout(push_constant) uniform PushConstants {
 };
 
 void main() {
-    ivec2 local_pos = ivec2(gl_GlobalInvocationID.xy);
-
-    double cr = origin_x + double(local_pos.x) * pixel_scale;
-    double ci = origin_y + double(local_pos.y) * pixel_scale;
+    double cr = origin_x + double(gl_GlobalInvocationID.x) * pixel_scale;
+    double ci = origin_y + double(gl_GlobalInvocationID.y) * pixel_scale;
 
     double zr = 0.0;
     double zi = 0.0;
@@ -48,68 +46,168 @@ void main() {
         zr = zr2 - zi2 + cr;
     }
 
-    imageStore(tile, local_pos, vec4(float(iter) / float(max_iterations), 0.0, 0.0, 0.0));
+    imageStore(tile, ivec2(gl_GlobalInvocationID.xy), vec4(float(iter) / float(max_iterations), 0.0, 0.0, 0.0));
 }
 "
     }
 }
 
+mod tilemap_shader {
+    vulkano_shaders::shader! {
+        ty: "compute",
+        src: r"
+#version 460
+
+layout(local_size_x = 2, local_size_y = 2) in;
+
+layout(set = 0, binding = 0, r16) uniform image2D in_tile;
+layout(set = 1, binding = 0, r32ui) uniform writeonly uimage2D map;
+
+layout(push_constant) uniform PushConstants {
+    int size;
+};
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 base = pos*size;
+    for (int y = 0; y < size; y++) {
+        for (int x = 0; x < size; x++) {
+            if (imageLoad(in_tile, base+ivec2(x, y)).r < 1.0) {
+                imageStore(map, pos, uvec4(0));
+                return;
+            }
+        }
+    }
+    imageStore(map, pos, uvec4(1));
+}
+"
+    }
+}
+
+struct MyPipeline {
+    pipeline: Arc<ComputePipeline>,
+    dset: RawDescriptorSet,
+}
 pub struct ComputeEngine {
     pub max_iterations: u32,
-    dset: RawDescriptorSet,
     vk: Arc<VulkanData>,
-    pipeline: Arc<ComputePipeline>,
+    _iv: Arc<ImageView>,
+    map_mem: *const u32,
+    row_pitch: usize,
+    tile_compute: MyPipeline,
+    map_compute: MyPipeline,
+    bar_map_in: ImageMemoryBarrier,
     fence: Fence,
+}
+
+fn find_memory_type(dev: &Device, memory_type_bits : u32) -> Option<u32> {
+    let types = &dev.physical_device().memory_properties().memory_types;
+    for (i, memory_type) in types.iter().enumerate() {
+        if memory_type_bits & (1 << i) != 0 && memory_type.property_flags.contains(MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT | MemoryPropertyFlags::HOST_CACHED) {
+            return Some(i as u32);
+        }
+    }
+    for (i, memory_type) in types.iter().enumerate() {
+        if memory_type_bits & (1 << i) != 0 && memory_type.property_flags.contains(MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT) {
+            return Some(i as u32);
+        }
+    }
+    None
 }
 
 impl ComputeEngine {
     pub fn new(vk: Arc<VulkanData>, max_iterations: u32) -> Self {
         let dev = vk.device.clone();
-        let shader = mandelbrot_shader::load(dev.clone())
-            .expect("failed to load mandelbrot compute shader");
+        let make_pipeline = |shader: Arc<ShaderModule>, mut set_layouts: Vec<Arc<DescriptorSetLayout>>| {
+            let entry = shader.entry_point("main").unwrap();
+            let stage = PipelineShaderStageCreateInfo::new(entry);
+            let pdslci = PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage]);
+            let dset_layout = DescriptorSetLayout::new(
+                dev.clone(), pdslci.set_layouts.last().unwrap().clone()).unwrap();
+            set_layouts.push(dset_layout.clone());
+            let layout = PipelineLayout::new(dev.clone(), PipelineLayoutCreateInfo {
+                flags: pdslci.flags,
+                set_layouts,
+                push_constant_ranges: pdslci.push_constant_ranges,
+                ..Default::default()
+            }).unwrap();
+            (MyPipeline {
+                pipeline: ComputePipeline::new(
+                    dev.clone(),
+                    None,
+                    ComputePipelineCreateInfo::stage_layout(stage, layout),
+                )
+                .expect("failed to create compute pipeline"),
+                dset: RawDescriptorSet::new(
+                    vk.descriptor_set_allocator.clone(),
+                    &dset_layout,
+                    1
+                ).unwrap(),
+            }, dset_layout)
+        };
 
-        let entry = shader.entry_point("main").unwrap();
-        let stage = PipelineShaderStageCreateInfo::new(entry);
-        let pdslci = PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage]);
-        let dset_layout = DescriptorSetLayout::new(dev.clone(), pdslci.set_layouts[0].clone()).unwrap();
-        let layout = PipelineLayout::new(dev.clone(), PipelineLayoutCreateInfo {
-            flags: pdslci.flags,
-            set_layouts: vec![dset_layout.clone()],
-            push_constant_ranges: pdslci.push_constant_ranges,
+        let (tile_compute, dset_layout) = make_pipeline(mandelbrot_shader::load(dev.clone())
+            .expect("failed to load mandelbrot compute shader"), vec![]);
+        let (map_compute, _) = make_pipeline(tilemap_shader::load(dev.clone())
+            .expect("failed to load tilemap compute shader"), vec![dset_layout]);
+        let raw_image = RawImage::new(dev.clone(), ImageCreateInfo{
+            image_type: ImageType::Dim2d,
+            format: Format::R32_UINT,
+            extent: [2, 2, 1],
+            tiling: ImageTiling::Linear,
+            usage: ImageUsage::STORAGE,
             ..Default::default()
-        }).unwrap();
+        }).expect("failed to create map image");
+        let req = raw_image.memory_requirements().first().unwrap();
+        let sz = req.layout.size();
+        let mut mem = DeviceMemory::allocate(dev.clone(), MemoryAllocateInfo{
+            allocation_size: sz,
+            memory_type_index: find_memory_type(dev.as_ref(), req.memory_type_bits).expect("no host visible memory type found"),
+            ..Default::default()
+        }).expect("failed to allocate map memory");
+        let row_pitch = raw_image.subresource_layout(ImageAspect::Color, 0, 0)
+            .expect("failed to get subresource layout").row_pitch;
+        mem.map(MemoryMapInfo{size: row_pitch+8,..Default::default()}).expect("failed to map map memory");
+        let map_mem = mem.mapping_state().expect("map memory is not mapped").ptr().as_ptr() as *const u32;
+        let map_img = ImageView::new_default(Arc::new(raw_image.bind_memory(
+            std::iter::once(unsafe { ResourceMemory::from_device_memory_unchecked(Arc::new(mem), 0, sz) })
+        ).map_err(|e| e.0).expect("failed to bind map memory"))).expect("failed to create map image view");
+        unsafe {
+            map_compute.dset.update(&[WriteDescriptorSet::image_view(0, map_img.clone())], &[])
+        }.expect("failed to update map descriptor set");
 
-        let pipeline = ComputePipeline::new(
-            dev.clone(),
-            None,
-            ComputePipelineCreateInfo::stage_layout(stage, layout),
-        )
-        .expect("failed to create compute pipeline");
-
-        ComputeEngine{max_iterations, pipeline,
-            dset: RawDescriptorSet::new(
-                vk.descriptor_set_allocator.clone(),
-                &dset_layout,
-                1
-            ).unwrap(), vk,
+        ComputeEngine{
             fence: Fence::new(dev.clone(), FenceCreateInfo::default()).unwrap(),
-            //semaphore: Semaphore::new(dev, SemaphoreCreateInfo{semaphore_type: SemaphoreType::Timeline,..Default::default() }).unwrap(),
+            bar_map_in: ImageMemoryBarrier {
+                src_stages: PipelineStages::TOP_OF_PIPE,
+                dst_stages: PipelineStages::COMPUTE_SHADER,
+                src_access: AccessFlags::empty(),
+                dst_access: AccessFlags::SHADER_WRITE,
+                old_layout: ImageLayout::Undefined,
+                new_layout: ImageLayout::General,
+                subresource_range: ImageSubresourceRange{aspects: ImageAspects::COLOR, mip_levels: 0..1, array_layers: 0..1},
+                ..ImageMemoryBarrier::image(map_img.image().clone())
+            },
+            max_iterations, vk, map_mem, tile_compute, map_compute, _iv: map_img, row_pitch: (row_pitch/4) as usize,
         }
     }
 
     /// Record compute dispatches for the given tile coords into a command buffer.
     pub fn compute_tile(
-        &self,
+        &mut self,
         iv: Arc<ImageView>,
         coord: TileCoord,
-    ) {
+    ) -> [bool; 4] {
         let (ox, oy) = coord.origin();
-        let push = mandelbrot_shader::PushConstants {
+        let push_tile = mandelbrot_shader::PushConstants {
             origin_x: ox,
             origin_y: oy,
             pixel_scale: coord.pixel_scale(),
             max_iterations: self.max_iterations,
             padding: 0,
+        };
+        let push_map = tilemap_shader::PushConstants {
+            size: (TILE_SIZE / 2) as i32,
         };
 
         let mut builder = RecordingCommandBuffer::new(
@@ -121,6 +219,7 @@ impl ComputeEngine {
                 ..Default::default()
             },
         ).unwrap();
+        let srr = ImageSubresourceRange{aspects: ImageAspects::COLOR, mip_levels: 0..1, array_layers: 0..1};
         let bar1 = ImageMemoryBarrier {
             src_stages: PipelineStages::TOP_OF_PIPE,
             dst_stages: PipelineStages::COMPUTE_SHADER,
@@ -128,21 +227,41 @@ impl ComputeEngine {
             dst_access: AccessFlags::SHADER_WRITE,
             old_layout: ImageLayout::Undefined,
             new_layout: ImageLayout::General,
-            subresource_range: ImageSubresourceRange{aspects: ImageAspects::COLOR, mip_levels: 0..1, array_layers: 0..1},
+            subresource_range: srr.clone(),
+            ..ImageMemoryBarrier::image(iv.image().clone())
+        };
+        let bar_tile_make_map = ImageMemoryBarrier {
+            src_stages: PipelineStages::COMPUTE_SHADER,
+            dst_stages: PipelineStages::COMPUTE_SHADER,
+            src_access: AccessFlags::SHADER_WRITE,
+            dst_access: AccessFlags::SHADER_READ,
+            old_layout: ImageLayout::General,
+            new_layout: ImageLayout::General,
+            subresource_range: srr.clone(),
+            ..ImageMemoryBarrier::image(iv.image().clone())
+        };
+        let bar_map_read = ImageMemoryBarrier {
+            src_stages: PipelineStages::COMPUTE_SHADER,
+            dst_stages: PipelineStages::HOST,
+            src_access: AccessFlags::SHADER_WRITE,
+            dst_access: AccessFlags::HOST_READ,
+            old_layout: ImageLayout::General,
+            new_layout: ImageLayout::General,
+            subresource_range: srr.clone(),
             ..ImageMemoryBarrier::image(iv.image().clone())
         };
         let queue_transfer = self.vk.compute_queue.queue_family_index() != self.vk.graphics_queue.queue_family_index();
-        let bar2 = if queue_transfer {
+        let bar_tile_out = if queue_transfer {
             ImageMemoryBarrier {
                 src_stages: PipelineStages::COMPUTE_SHADER,
                 dst_stages: PipelineStages::BOTTOM_OF_PIPE,
-                src_access: AccessFlags::SHADER_WRITE,
+                src_access: AccessFlags::SHADER_READ,
                 dst_access: AccessFlags::empty(),
                 old_layout: ImageLayout::General,
                 new_layout: ImageLayout::ShaderReadOnlyOptimal,
                 queue_family_ownership_transfer: Some(QueueFamilyOwnershipTransfer::ExclusiveBetweenLocal {
                     src_index: self.vk.compute_queue.queue_family_index(), dst_index: self.vk.graphics_queue.queue_family_index()}),
-                subresource_range: ImageSubresourceRange{aspects: ImageAspects::COLOR, mip_levels: 0..1, array_layers: 0..1},
+                subresource_range: srr.clone(),
                 ..ImageMemoryBarrier::image(iv.image().clone())
             }
         } else {
@@ -153,29 +272,45 @@ impl ComputeEngine {
                 dst_access: AccessFlags::SHADER_READ,
                 old_layout: ImageLayout::General,
                 new_layout: ImageLayout::ShaderReadOnlyOptimal,
-                subresource_range: ImageSubresourceRange{aspects: ImageAspects::COLOR, mip_levels: 0..1, array_layers: 0..1},
+                subresource_range: srr.clone(),
                 ..ImageMemoryBarrier::image(iv.image().clone())
             }
         };
         let cb = unsafe {
-            self.dset.update(&[WriteDescriptorSet::image_view(0, iv.clone())], &[])
+            self.tile_compute.dset.update(&[WriteDescriptorSet::image_view(0, iv.clone())], &[])
                 .expect("failed to update descriptor set");
             builder
-            .bind_pipeline_compute(&self.pipeline)
+            .bind_pipeline_compute(&self.tile_compute.pipeline)
             .unwrap()
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
-                &mut self.pipeline.layout(),
-                0,&[&self.dset],&[]
+                &mut self.tile_compute.pipeline.layout(),
+                0,&[&self.tile_compute.dset],&[]
             )
             .unwrap()
-            .push_constants(&self.pipeline.layout(), 0, &push)
+            .push_constants(&self.tile_compute.pipeline.layout(), 0, &push_tile)
             .unwrap()
             .pipeline_barrier(&DependencyInfo{image_memory_barriers: smallvec![bar1],..Default::default()})
             .unwrap()
             .dispatch([TILE_SIZE / 16, TILE_SIZE / 16, 1])
             .unwrap()
-            .pipeline_barrier(&DependencyInfo{image_memory_barriers: smallvec![bar2],..Default::default()})
+            .pipeline_barrier(&DependencyInfo{image_memory_barriers: smallvec![bar_tile_make_map, self.bar_map_in.clone()],..Default::default()})
+            .unwrap()
+            .bind_pipeline_compute(&self.map_compute.pipeline)
+            .unwrap()
+            .bind_descriptor_sets(
+                PipelineBindPoint::Compute,
+                &mut self.map_compute.pipeline.layout(),
+                0,&[&self.tile_compute.dset, &self.map_compute.dset],&[]
+            )
+            .unwrap()
+            .push_constants(&self.tile_compute.pipeline.layout(), 0, &push_map)
+            .unwrap()
+            .dispatch([1, 1, 1])
+            .unwrap()
+            .pipeline_barrier(&DependencyInfo{image_memory_barriers: smallvec![bar_map_read],..Default::default()})
+            .unwrap()
+            .pipeline_barrier(&DependencyInfo{image_memory_barriers: smallvec![bar_tile_out],..Default::default()})
             .unwrap();
             builder.end()
         }.expect("failed to build compute command buffer");
@@ -227,10 +362,18 @@ impl ComputeEngine {
                     panic!("failed to submit queue transfer command buffer");
                 }
             });
+        }
+        self.bar_map_in.src_stages = PipelineStages::HOST;
+        self.bar_map_in.src_access = AccessFlags::HOST_READ;
+        self.bar_map_in.old_layout = ImageLayout::General;
+        let row1 = unsafe { std::ptr::read_volatile(self.map_mem as *const [u32;2]) };
+        let row2= unsafe { std::ptr::read_volatile(self.map_mem.add(self.row_pitch) as *const [u32;2]) };
+        if queue_transfer {
             self.fence.wait(None).expect("Vulkan fence wait failed");
             unsafe {
                 self.fence.reset().expect("Vulkan fence reset failed");
             }
         }
+        [row1[0] > 0, row1[1] > 0, row2[0] > 0, row2[1] > 0]
     }
 }

@@ -8,7 +8,7 @@ use vulkano::{
     memory::{DeviceMemory, MemoryAllocateInfo, MemoryPropertyFlags, ResourceMemory, allocator::align_up},
 };
 
-use crate::camera::Viewport;
+use crate::{camera::Viewport, tile::ChildNode::Present};
 
 pub const TILE_SIZE: u32 = 256;
 pub const ARENA_SIZE: u32 = 1024;
@@ -210,14 +210,29 @@ impl TilePool {
 
 const MAX_DEPTH: u32 = 46;
 
+enum ChildNode {
+    Pending,
+    Blocked,
+    Present(Box<QuadTreeNode>)
+}
+
+impl ChildNode {
+    fn as_ref(&self) -> Option<&QuadTreeNode> {
+        match self {
+            ChildNode::Present(node) => Some(node),
+            _ => None,
+        }
+    }
+}
+
 struct QuadTreeNode {
     item: Arc<ImageView>,
-    children: [Option<Box<QuadTreeNode>>; 4],
+    children: [ChildNode; 4],
 }
 
 impl QuadTreeNode {
-    fn new(item: Arc<ImageView>) -> Self {
-        QuadTreeNode {item: item, children: Default::default()}
+    fn new(item: Arc<ImageView>, blocks: [bool; 4]) -> Self {
+        QuadTreeNode {item: item, children: blocks.map(|b| if b { ChildNode::Blocked } else { ChildNode::Pending })}
     }
 
     fn get(&self, coord: TileCoord) -> Option<&Arc<ImageView>> {
@@ -229,51 +244,60 @@ impl QuadTreeNode {
             }
         }
     }
-    fn insert(&mut self, coord: TileCoord, tile: Option<Arc<ImageView>>) -> bool {
+    fn insert(&mut self, coord: TileCoord, tile: Option<Arc<ImageView>>, blocks: [bool; 4]) -> bool {
         match coord.level {
-            1 => {self.children[(coord.y * 2 + coord.x) as usize] = tile.map(|t| Box::new(QuadTreeNode::new(t))); true}
+            1 => {
+                self.children[(coord.y * 2 + coord.x) as usize] = match tile {
+                    None => ChildNode::Pending,
+                    Some(t) => ChildNode::Present(Box::new(QuadTreeNode::new(t, blocks))),
+                };
+                true
+            }
             _ => {
                 let (quadrant, child_coord) = coord.child();
-                match self.children[quadrant].as_mut() {
-                    Some(child) => child.insert(child_coord, tile),
-                    None => false,
+                match &mut self.children[quadrant] {
+                    Present(child) => child.insert(child_coord, tile, blocks),
+                    _ => false,
                 }
             }
         }
     }
 
-    fn children_iter(&self, coord: TileCoord, vp: &Viewport) -> impl Iterator<Item = (TileCoord, &Option<Box<QuadTreeNode>>)> {
-        coord.children().into_iter().zip(self.children.iter()).filter(|(child_coord, _)| child_coord.overlaps(vp))
+    fn children_iter(&mut self, coord: TileCoord, vp: &Viewport) -> impl Iterator<Item = (TileCoord, &mut ChildNode)> {
+        coord.children().into_iter().zip(self.children.iter_mut()).filter(|(child_coord, _)| child_coord.overlaps(vp))
     }
 
-    fn collect_visible(&self, coord: TileCoord, vp: &Viewport, result: &mut Vec<(TileCoord, Arc<ImageView>)>) {
+    fn collect_visible(&mut self, coord: TileCoord, vp: &Viewport, result: &mut Vec<(TileCoord, Arc<ImageView>)>) {
         let target_depth = coord.pixel_scale() <= vp.pixel_scale || coord.level >= MAX_DEPTH;
-        if target_depth || self.children.iter().any(|c| c.is_none()) {
+        if target_depth || self.children.iter().any(|c| !matches!(c, ChildNode::Present(_))) {
             result.push((coord.clone(), self.item.clone()));
         }
         if target_depth {
             return;
         }
         for (child_coord, child) in self.children_iter(coord, vp) {
-            if let Some(child) = child {
+            if let Present(child) = child {
                 child.collect_visible(child_coord, vp, result);
             }
         }
     }
 
-    fn next_tile(&self, coord: TileCoord, vp: &Viewport) -> Option<TileCoord> {
-        let mut result: Option<TileCoord> = None;
-        let go_deeper = coord.level < MAX_DEPTH && coord.pixel_scale() > vp.pixel_scale;
+    fn next_tile(&mut self, coord: TileCoord, vp: &Viewport) -> Option<(TileCoord, &mut ChildNode)> {
+        let mut result: Option<(TileCoord, &mut ChildNode)> = None;
+        let mut go_deeper = coord.level < MAX_DEPTH && coord.pixel_scale() > vp.pixel_scale;
         for (child_coord, child) in self.children_iter(coord, vp) {
             match child {
-                None => return Some(child_coord),
-                Some(child) if go_deeper => {
+                ChildNode::Pending => return Some((child_coord, child)),
+                ChildNode::Present(child) if go_deeper => {
                     if let Some(deeper_tile) = child.next_tile(child_coord, vp) {
+                        if deeper_tile.0.level <= child_coord.level+1 {
+                            go_deeper = false;
+                        }
                         result = match result {
                             None => Some(deeper_tile),
-                            Some(tc) if deeper_tile.level < tc.level => Some(deeper_tile),
+                            Some(tc) if deeper_tile.0.level < tc.0.level => Some(deeper_tile),
                             otc => otc,
-                        }
+                        };
                     }
                 }
                 _ => (),
@@ -289,12 +313,12 @@ impl QuadTree {
     pub fn new() -> Self {
         QuadTree { root: None }
     }
-    pub fn insert(&mut self, coord: TileCoord, tile: Option<Arc<ImageView>>) -> bool {
+    pub fn insert(&mut self, coord: TileCoord, tile: Option<Arc<ImageView>>, blocks: [bool; 4]) -> bool {
         match coord.level {
-            0 => { self.root = tile.map(|t| QuadTreeNode::new(t)); true}
+            0 => { self.root = tile.map(|t| QuadTreeNode::new(t, blocks)); true}
             _ => {
                 match self.root.as_mut() {
-                    Some(root) => root.insert(coord, tile),
+                    Some(root) => root.insert(coord, tile, blocks),
                     None => false,
                 }
             }
@@ -302,20 +326,26 @@ impl QuadTree {
     }
     /// Find visible tiles at the best available resolution for the given viewport.
     /// Returns list of (TileCoord, TileSlot, screen_rect) for rendering.
-    pub fn get_visible_tiles(&self, vp: &Viewport) -> Vec<(TileCoord, Arc<ImageView>)> {
+    pub fn get_visible_tiles(&mut self, vp: &Viewport) -> Vec<(TileCoord, Arc<ImageView>)> {
         let mut result = Vec::new();
-        if let Some(root) = &self.root {
+        if let Some(root) = &mut self.root {
             root.collect_visible(TileCoord::root(), vp, &mut result);
         }
         result
     }
     /// Find next tiles that need to be computed to improve resolution for the viewport.
     /// Returns coords not yet in the tree that would refine visible areas.
-    pub fn next_tile(&self, vp: Viewport) -> Option<TileCoord> {
+    pub fn next_tile(&mut self, vp: Viewport) -> Option<TileCoord> {
         let root_coord = TileCoord::root();
-        match &self.root {
+        match &mut self.root {
             None => Some(root_coord),
-            Some(root) => root.next_tile(root_coord, &vp.scale_pix(2.0)),
+            Some(root) => {
+                let result = root.next_tile(root_coord, &vp.scale_pix(2.0));
+                result.map(|(coord, child)| {
+                    *child = ChildNode::Blocked;
+                    coord
+                })
+            }
         }
     }
 }
