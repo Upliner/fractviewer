@@ -307,19 +307,25 @@ impl QuadTreeNode {
     }
 }
 pub struct QuadTree {
-    root: Option<QuadTreeNode>,
+    root: ChildNode,
 }
 impl QuadTree {
     pub fn new() -> Self {
-        QuadTree { root: None }
+        QuadTree { root: ChildNode::Pending }
     }
     pub fn insert(&mut self, coord: TileCoord, tile: Option<Arc<ImageView>>, blocks: [bool; 4]) -> bool {
         match coord.level {
-            0 => { self.root = tile.map(|t| QuadTreeNode::new(t, blocks)); true}
+            0 => {
+                self.root = match tile {
+                    None => ChildNode::Pending,
+                    Some(t) => ChildNode::Present(Box::new(QuadTreeNode::new(t, blocks))),
+                };
+                true
+            }
             _ => {
-                match self.root.as_mut() {
-                    Some(root) => root.insert(coord, tile, blocks),
-                    None => false,
+                match &mut self.root {
+                    Present(root) => root.insert(coord, tile, blocks),
+                    _ => false,
                 }
             }
         }
@@ -328,7 +334,7 @@ impl QuadTree {
     /// Returns list of (TileCoord, TileSlot, screen_rect) for rendering.
     pub fn get_visible_tiles(&mut self, vp: &Viewport) -> Vec<(TileCoord, Arc<ImageView>)> {
         let mut result = Vec::new();
-        if let Some(root) = &mut self.root {
+        if let Present(root) = &mut self.root {
             root.collect_visible(TileCoord::root(), vp, &mut result);
         }
         result
@@ -338,8 +344,12 @@ impl QuadTree {
     pub fn next_tile(&mut self, vp: Viewport) -> Option<TileCoord> {
         let root_coord = TileCoord::root();
         match &mut self.root {
-            None => Some(root_coord),
-            Some(root) => {
+            ChildNode::Pending => {
+                self.root = ChildNode::Blocked;
+                Some(root_coord)
+            },
+            ChildNode::Blocked => None,
+            ChildNode::Present(root) => {
                 let result = root.next_tile(root_coord, &vp.scale_pix(2.0));
                 result.map(|(coord, child)| {
                     *child = ChildNode::Blocked;

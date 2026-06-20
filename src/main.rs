@@ -4,11 +4,9 @@ mod context;
 mod render;
 mod tile;
 
-use std::{ops::{DerefMut}, sync::{Arc, Condvar, Mutex}, thread, time::Instant};
+use std::{ops::DerefMut, sync::{Arc, Condvar, Mutex}, thread::{self, JoinHandle}, time::Instant};
 use vulkano::{
-    command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage},
-    pipeline::graphics::viewport::Viewport,
-    sync::GpuFuture,
+    command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage}, device::Queue, pipeline::graphics::viewport::Viewport, sync::GpuFuture
 };
 use winit::{
     application::ApplicationHandler,
@@ -24,26 +22,52 @@ use render::Renderer;
 use tile::{QuadTree, TilePool};
 
 const MAX_ITERATIONS: u32 = 8192;
-struct Worker {
-    data: Arc<SharedData>,
-    join_handle: thread::JoinHandle<()>,
-}
-#[derive(PartialEq)]
+#[derive(PartialEq, Debug)]
 enum WorkerState {
     Idle,
     Work,
     Finish
 }
 struct SharedData {
+    vk: Arc<VulkanData>,
+    pool: Mutex<TilePool>,
     window: Arc<Window>,
     quadtree: Mutex<QuadTree>,
     camera: Mutex<Camera>,
     state: Mutex<WorkerState>,
     cond_var: Condvar,
 }
+struct SeriesCounter {
+    worker_id: usize,
+    start_time: Instant,
+    tile_count: u32,
+    cull_count: u32,
+}
+impl SeriesCounter {
+    fn new(worker_id: usize) -> Self {
+        SeriesCounter {
+            worker_id,
+            start_time: Instant::now(),
+            tile_count: 0,
+            cull_count: 0,
+       }
+    }
+    fn report(&mut self) {
+        if self.tile_count == 0 {
+            return;
+        }
+        let elapsed = self.start_time.elapsed();
+        eprintln!("Worker {} Computed {} tiles in {:?} ({:.2} tiles/s), {} tiles culled",
+            self.worker_id, self.tile_count, elapsed, self.tile_count as f64 / elapsed.as_secs_f64(), self.cull_count);
+        self.tile_count = 0;
+        self.cull_count = 0;
+    }
+}
 impl SharedData {
-    fn new(window: Arc<Window>) -> Self {
+    fn new(vk: Arc<VulkanData>, window: Arc<Window>) -> Self {
         SharedData {
+            pool: Mutex::new(TilePool::new(vk.device.clone())),
+            vk,
             window,
             quadtree: Mutex::new(QuadTree::new()),
             camera: Mutex::new(Camera::new()),
@@ -68,80 +92,56 @@ impl SharedData {
         if *state == WorkerState::Work {
             *state = WorkerState::Idle;
         }
-        self.cond_var.notify_all();
     }
-    fn check_state(&self) -> bool {
+    fn check_state(&self, sc: &mut SeriesCounter) -> bool {
         let mut state = self.state.lock().unwrap();
         while *state == WorkerState::Idle {
+            sc.report();
             state = self.cond_var.wait(state).unwrap();
+            sc.start_time = Instant::now();
         }
         return *state != WorkerState::Finish;
     }
 }
-impl Worker {
-    fn new(vk: Arc<VulkanData>, window: Arc<Window>) -> Self {
-        let data = Arc::new(SharedData::new(window));
-        Worker {
-            data: data.clone(),
-            join_handle: thread::spawn(move || Worker::run(vk, data)),
+fn run_worker(data: Arc<SharedData>, q: Arc<Queue>, id: usize) -> JoinHandle<()> {
+    thread::spawn(move || worker_func(data, q, id))
+}
+fn worker_func(data: Arc<SharedData>, q: Arc<Queue>, id: usize) {
+    let vk = &data.vk;
+    let mut compute = ComputeEngine::new(vk.clone(), MAX_ITERATIONS);
+    let mut sc = SeriesCounter::new(id);
+    while data.check_state(&mut sc) {
+        let (w, h) = data.window.inner_size().into();
+        if w == 0 || h == 0 {
+            data.go_idle();
+            continue;
         }
-    }
-    fn run(vk: Arc<VulkanData>, data: Arc<SharedData>) {
-        let mut pool = TilePool::new(vk.device.clone());
-        let mut compute = ComputeEngine::new(vk.clone(), MAX_ITERATIONS);
-        let mut series_start: bool = false;
-        let mut series_start_time: Instant = Instant::now();
-        let mut tile_count: u32 = 0;
-        let mut cull_count: u32 = 0;
-        while data.check_state() {
-            if series_start {
-                series_start = false;
-                series_start_time = Instant::now();
+        // Find tiles that need computing
+        let tile_coord = data.quadtree.lock().unwrap().next_tile(data.camera.lock().unwrap().viewport(w, h));
+        if let Some(tile_coord) = tile_coord {
+            let tile = data.pool.lock().unwrap().allocate();
+            let blocks = compute.compute_tile(
+                &q,
+                tile.clone(),
+                tile_coord,
+            );
+            blocks.iter().for_each(|block| if *block { sc.cull_count += 1; });
+            if !data.quadtree.lock().unwrap().insert(tile_coord, Some(tile), blocks) {
+                eprintln!("Failed to insert tile to location {:?}", tile_coord);
             }
-            let mut go_idle = || {
-                series_start = true;
-                if tile_count > 0 {
-                    let elapsed = series_start_time.elapsed();
-                    eprintln!("Computed {} tiles in {:?} ({:.2} tiles/s), {} tiles culled", tile_count, elapsed, tile_count as f64 / elapsed.as_secs_f64(), cull_count);
-                    tile_count = 0;
-                    cull_count = 0;
-                }
-                data.go_idle();
-            };
-            let (w, h) = data.window.inner_size().into();
-            if w == 0 || h == 0 {
-                go_idle();
-                continue;
-            }
-
-            // Find tiles that need computing
-            let tile_coord = data.quadtree.lock().unwrap().next_tile(data.camera.lock().unwrap().viewport(w, h));
-            if let Some(tile_coord) = tile_coord {
-                let tile = pool.allocate();
-                let blocks = compute.compute_tile(
-                    tile.clone(),
-                    tile_coord,
-                );
-                blocks.iter().for_each(|block| if *block { cull_count += 1; });
-                if !data.quadtree.lock().unwrap().insert(tile_coord, Some(tile), blocks) {
-                    eprintln!("Failed to insert tile to location {:?}", tile_coord);
-                }
-                tile_count += 1;
-                data.window.request_redraw();
-            } else {
-                go_idle();
-            }
+            data.signal_check();
+            sc.tile_count += 1;
+            data.window.request_redraw();
+        } else {
+            data.go_idle();
         }
-    }
-    fn finish(self) {
-        self.data.signal_exit();
-        self.join_handle.join().unwrap();
     }
 }
 struct AppInternal {
     ctx: VulkanContext,
     renderer: Renderer,
-    worker: Worker,
+    sd: Arc<SharedData>,
+    workers: Vec<JoinHandle<()>>,
     left_mouse_down: bool,
     right_mouse_down: bool,
     cursor_pos: (f64, f64),
@@ -156,28 +156,27 @@ impl App {
 }
 impl AppInternal {
     fn camera(&self) -> impl DerefMut<Target = Camera> {
-        self.worker.data.camera.lock().unwrap()
+        self.sd.camera.lock().unwrap()
     }
     fn window(&self) -> &Window {
-        self.worker.data.window.as_ref()
+        self.sd.window.as_ref()
     }
     fn new(event_loop: &ActiveEventLoop) -> Self {
         let attrs = WindowAttributes::default().with_title("Fractal Viewer - Mandelbrot");
         let window = Arc::new(event_loop.create_window(attrs).expect("Failed to create window"));
         let ctx = VulkanContext::new(window.clone());
-        let renderer = Renderer::new(&ctx.data.device, ctx.subpass(), ctx.sample_count);
-        let worker = Worker::new(ctx.data.clone(), window);
+        let sd = Arc::new(SharedData::new(ctx.data.clone(), window));
         AppInternal {
-            ctx,
-            renderer,
-            worker,
+            renderer: Renderer::new(&ctx.data.device, ctx.subpass(), ctx.sample_count),
+            workers: ctx.compute_queues.iter().enumerate().map(|(i, q)| run_worker(sd.clone(), q.clone(), i)).collect(),
+            ctx, sd,
             left_mouse_down: false,
             right_mouse_down: false,
             cursor_pos: (0.0, 0.0),
         }
     }
     fn redraw(&mut self) {
-        self.ctx.recreate_swapchain_if_needed(self.worker.data.window.as_ref());
+        self.ctx.recreate_swapchain_if_needed(self.sd.window.as_ref());
 
         let [w, h] = self.ctx.window_size();
         if w == 0 || h == 0 {
@@ -212,7 +211,7 @@ impl AppInternal {
 
 
         // Collect visible tiles for rendering (includes newly computed ones)
-        let visible = self.worker.data.quadtree.lock().unwrap().get_visible_tiles(&vp);
+        let visible = self.sd.quadtree.lock().unwrap().get_visible_tiles(&vp);
 
         let viewport = Viewport {
             offset: [0.0, 0.0],
@@ -245,14 +244,14 @@ impl AppInternal {
         // Request continuous redraw if zooming or tiles still needed
         if self.left_mouse_down || self.right_mouse_down {
             self.window().request_redraw();
-            self.worker.data.signal_check();
+            self.sd.signal_check();
         }
     }
     fn window_event(&mut self, event: WindowEvent) {
         match event {
             WindowEvent::Resized(_) => {
                 self.ctx.recreate_swapchain = true;
-                self.worker.data.signal_check();
+                self.sd.signal_check();
                 self.window().request_redraw();
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -284,6 +283,10 @@ impl AppInternal {
             _ => {}
         }
     }
+    fn finish(self) {
+        self.sd.signal_exit();
+        self.workers.into_iter().for_each(|w| w.join().unwrap());
+    }
 }
 
 impl ApplicationHandler for App {
@@ -303,7 +306,7 @@ impl ApplicationHandler for App {
     ) {
         if event == WindowEvent::CloseRequested {
             if let Some(app) = self.0.take() {
-                app.worker.finish();
+                app.finish();
             }
             event_loop.exit();
         } else if let Some(app) = &mut self.0 {

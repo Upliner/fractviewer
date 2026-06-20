@@ -4,7 +4,7 @@ use ash::vk;
 use vulkano::{
     VulkanObject, command_buffer::{CommandBufferBeginInfo, CommandBufferLevel, CommandBufferUsage, RecordingCommandBuffer}, descriptor_set::{
         WriteDescriptorSet, layout::DescriptorSetLayout, sys::RawDescriptorSet
-    }, device::Device, format::Format, image::{ImageAspect, ImageAspects, ImageCreateInfo, ImageLayout, ImageSubresourceRange, ImageTiling, ImageType, ImageUsage, sys::RawImage, view::ImageView}, memory::{DeviceMemory, MemoryAllocateInfo, MemoryMapInfo, MemoryPropertyFlags, ResourceMemory}, pipeline::{
+    }, device::{Device, Queue}, format::Format, image::{ImageAspect, ImageAspects, ImageCreateInfo, ImageLayout, ImageSubresourceRange, ImageTiling, ImageType, ImageUsage, sys::RawImage, view::ImageView}, memory::{DeviceMemory, MemoryAllocateInfo, MemoryMapInfo, MemoryPropertyFlags, ResourceMemory}, pipeline::{
         ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo, compute::ComputePipelineCreateInfo, layout::{PipelineDescriptorSetLayoutCreateInfo, PipelineLayoutCreateInfo}
     }, shader::ShaderModule, sync::{AccessFlags, DependencyInfo, ImageMemoryBarrier, PipelineStages, QueueFamilyOwnershipTransfer, fence::{Fence, FenceCreateInfo}}
 };
@@ -195,6 +195,7 @@ impl ComputeEngine {
     /// Record compute dispatches for the given tile coords into a command buffer.
     pub fn compute_tile(
         &mut self,
+        q: &Arc<Queue>,
         iv: Arc<ImageView>,
         coord: TileCoord,
     ) -> [bool; 4] {
@@ -210,9 +211,10 @@ impl ComputeEngine {
             size: (TILE_SIZE / 2) as i32,
         };
 
+        let qfi = q.queue_family_index();
+
         let mut builder = RecordingCommandBuffer::new(
-            self.vk.command_buffer_allocator.clone(),
-            self.vk.compute_queue.queue_family_index(),
+            self.vk.command_buffer_allocator.clone(), qfi,
             CommandBufferLevel::Primary,
             CommandBufferBeginInfo {
                 usage: CommandBufferUsage::OneTimeSubmit,
@@ -250,7 +252,8 @@ impl ComputeEngine {
             subresource_range: srr.clone(),
             ..ImageMemoryBarrier::image(iv.image().clone())
         };
-        let queue_transfer = self.vk.compute_queue.queue_family_index() != self.vk.graphics_queue.queue_family_index();
+        let gqfi = self.vk.graphics_queue.queue_family_index();
+        let queue_transfer = qfi != gqfi;
         let bar_tile_out = if queue_transfer {
             ImageMemoryBarrier {
                 src_stages: PipelineStages::COMPUTE_SHADER,
@@ -260,7 +263,7 @@ impl ComputeEngine {
                 old_layout: ImageLayout::General,
                 new_layout: ImageLayout::ShaderReadOnlyOptimal,
                 queue_family_ownership_transfer: Some(QueueFamilyOwnershipTransfer::ExclusiveBetweenLocal {
-                    src_index: self.vk.compute_queue.queue_family_index(), dst_index: self.vk.graphics_queue.queue_family_index()}),
+                    src_index: qfi, dst_index: gqfi}),
                 subresource_range: srr.clone(),
                 ..ImageMemoryBarrier::image(iv.image().clone())
             }
@@ -316,8 +319,8 @@ impl ComputeEngine {
         }.expect("failed to build compute command buffer");
         let cb_arr = [cb.handle()];
         let submit_info = vk::SubmitInfo::default().command_buffers(&cb_arr);
-        self.vk.compute_queue.with(|_| unsafe {
-            let result = (self.vk.device.fns().v1_0.queue_submit)(self.vk.compute_queue.handle(), 1, &submit_info, self.fence.handle());
+        q.with(|_| unsafe {
+            let result = (self.vk.device.fns().v1_0.queue_submit)(q.handle(), 1, &submit_info, self.fence.handle());
             if result != vk::Result::SUCCESS {
                 panic!("failed to submit compute command buffer");
             }
@@ -329,7 +332,7 @@ impl ComputeEngine {
         if queue_transfer {
             let mut builder = RecordingCommandBuffer::new(
                 self.vk.command_buffer_allocator.clone(),
-                self.vk.graphics_queue.queue_family_index(),
+                gqfi,
                 CommandBufferLevel::Primary,
                 CommandBufferBeginInfo {
                     usage: CommandBufferUsage::OneTimeSubmit,
@@ -344,7 +347,7 @@ impl ComputeEngine {
                 old_layout: ImageLayout::General,
                 new_layout: ImageLayout::ShaderReadOnlyOptimal,
                 queue_family_ownership_transfer: Some(QueueFamilyOwnershipTransfer::ExclusiveBetweenLocal {
-                    src_index: self.vk.compute_queue.queue_family_index(), dst_index: self.vk.graphics_queue.queue_family_index()}),
+                    src_index: qfi, dst_index: gqfi}),
                 subresource_range: ImageSubresourceRange{aspects: ImageAspects::COLOR, mip_levels: 0..1, array_layers: 0..1},
                 ..ImageMemoryBarrier::image(iv.image().clone())
             };
