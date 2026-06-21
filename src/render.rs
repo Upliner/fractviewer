@@ -236,7 +236,7 @@ impl Renderer {
 
             let set = DescriptorSet::new(
                 descriptor_set_allocator.clone(),
-                self.pipeline.layout().set_layouts().get(0).unwrap().clone(),
+                self.pipeline.layout().set_layouts().first().unwrap().clone(),
                 [
                     WriteDescriptorSet::image_view_sampler(
                         0,

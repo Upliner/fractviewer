@@ -86,14 +86,13 @@ impl VulkanContext {
                 if compute_families.is_empty() {
                     return None;
                 }
-                let mut queues = Vec::<QueueCreateInfo>::new();
+                let mut queues = Vec::<QueueCreateInfo>::with_capacity(TARGET_COMPUTE_CNT + 1);
                 let compute_cnt = Cell::new(0);
-                queues.reserve(TARGET_COMPUTE_CNT + 1);
                 let mut add_compute_family = |(i, q): (u32, &QueueFamilyProperties)| {
                     let cnt = min(q.queue_count as usize, TARGET_COMPUTE_CNT - compute_cnt.get());
                     queues.push(QueueCreateInfo {
                         queue_family_index: i,
-                        queues: std::iter::repeat(COMPUTE_PRIO).take(cnt).collect(),
+                        queues: std::iter::repeat_n(COMPUTE_PRIO, cnt).collect(),
                         ..Default::default()
                     });
                     compute_cnt.update(|c| c + cnt);
@@ -117,13 +116,10 @@ impl VulkanContext {
                             let Some(cf) = separate_compute_families.next() {
                         add_compute_family(cf);
                     }
-                    let mut gqueues = Vec::<f32>::new();
-                    gqueues.reserve(TARGET_COMPUTE_CNT + 1);
+                    let mut gqueues = Vec::<f32>::with_capacity(TARGET_COMPUTE_CNT + 1);
                     let cnt = min((TARGET_COMPUTE_CNT-compute_cnt.get()) as i64, graphics_family.1.queue_count as i64-1);
                     if cnt > 0 {
-                        for _ in 0..(cnt as usize) {
-                            gqueues.push(COMPUTE_PRIO);
-                        }
+                        gqueues.extend(std::iter::repeat_n(COMPUTE_PRIO, cnt as usize));
                     }
                     gqueues.push(1.0);
                     queues.push(QueueCreateInfo {

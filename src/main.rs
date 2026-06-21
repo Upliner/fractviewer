@@ -100,7 +100,7 @@ impl SharedData {
             state = self.cond_var.wait(state).unwrap();
             sc.start_time = Instant::now();
         }
-        return *state != WorkerState::Finish;
+        *state != WorkerState::Finish
     }
 }
 fn run_worker(data: Arc<SharedData>, q: Arc<Queue>, id: usize) -> JoinHandle<()> {

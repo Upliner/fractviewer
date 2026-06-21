@@ -279,19 +279,18 @@ impl ComputeEngine {
                 ..ImageMemoryBarrier::image(iv.image().clone())
             }
         };
+        let tile_layout = self.tile_compute.pipeline.layout().as_ref();
+        let map_layout = self.map_compute.pipeline.layout().as_ref();
         let cb = unsafe {
             self.tile_compute.dset.update(&[WriteDescriptorSet::image_view(0, iv.clone())], &[])
                 .expect("failed to update descriptor set");
             builder
             .bind_pipeline_compute(&self.tile_compute.pipeline)
             .unwrap()
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                &mut self.tile_compute.pipeline.layout(),
-                0,&[&self.tile_compute.dset],&[]
-            )
+            .bind_descriptor_sets(PipelineBindPoint::Compute, tile_layout, 0,
+                &[&self.tile_compute.dset],&[])
             .unwrap()
-            .push_constants(&self.tile_compute.pipeline.layout(), 0, &push_tile)
+            .push_constants(tile_layout, 0, &push_tile)
             .unwrap()
             .pipeline_barrier(&DependencyInfo{image_memory_barriers: smallvec![bar1],..Default::default()})
             .unwrap()
@@ -301,13 +300,10 @@ impl ComputeEngine {
             .unwrap()
             .bind_pipeline_compute(&self.map_compute.pipeline)
             .unwrap()
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                &mut self.map_compute.pipeline.layout(),
-                0,&[&self.tile_compute.dset, &self.map_compute.dset],&[]
-            )
+            .bind_descriptor_sets(PipelineBindPoint::Compute, map_layout, 0,
+                &[&self.tile_compute.dset, &self.map_compute.dset],&[] )
             .unwrap()
-            .push_constants(&self.tile_compute.pipeline.layout(), 0, &push_map)
+            .push_constants(map_layout, 0, &push_map)
             .unwrap()
             .dispatch([1, 1, 1])
             .unwrap()

@@ -178,10 +178,8 @@ impl TilePool {
     }
 
     pub fn allocate(&mut self) -> Arc<ImageView> {
-        if let Some(arena) = &mut self.cur_arena {
-            if let Some(iv) = arena.make() {
-                return iv;
-            }
+        if let Some(arena) = &mut self.cur_arena && let Some(iv) = arena.make() {
+            return iv;
         }
         let (new_arena, iv) = TileArena::new_default(&self.dev);
         self.cur_arena = Some(new_arena);
@@ -194,6 +192,7 @@ const MAX_DEPTH: u32 = 46;
 enum ChildNode {
     Pending,
     Blocked,
+    Computing,
     Present(Box<QuadTreeNode>)
 }
 
@@ -213,7 +212,7 @@ struct QuadTreeNode {
 
 impl QuadTreeNode {
     fn new(item: Arc<ImageView>, blocks: [bool; 4]) -> Self {
-        QuadTreeNode {item: item, children: blocks.map(|b| if b { ChildNode::Blocked } else { ChildNode::Pending })}
+        QuadTreeNode {item, children: blocks.map(|b| if b { ChildNode::Blocked } else { ChildNode::Pending })}
     }
 
     fn get(&self, coord: TileCoord) -> Option<&Arc<ImageView>> {
@@ -226,20 +225,22 @@ impl QuadTreeNode {
         }
     }
     fn insert(&mut self, coord: TileCoord, tile: Option<Arc<ImageView>>, blocks: [bool; 4]) -> bool {
-        match coord.level {
-            1 => {
-                self.children[(coord.y * 2 + coord.x) as usize] = match tile {
+        if coord.level > 1{
+            let (quadrant, child_coord) = coord.child();
+            match &mut self.children[quadrant] {
+                Present(child) => child.insert(child_coord, tile, blocks),
+                _ => false,
+            }
+        } else {
+            let dest = &mut self.children[(coord.y * 2 + coord.x) as usize];
+            if matches!(dest, ChildNode::Present(_)) {
+                false
+            } else {
+                *dest = match tile {
                     None => ChildNode::Pending,
                     Some(t) => ChildNode::Present(Box::new(QuadTreeNode::new(t, blocks))),
                 };
                 true
-            }
-            _ => {
-                let (quadrant, child_coord) = coord.child();
-                match &mut self.children[quadrant] {
-                    Present(child) => child.insert(child_coord, tile, blocks),
-                    _ => false,
-                }
             }
         }
     }
@@ -251,7 +252,7 @@ impl QuadTreeNode {
     fn collect_visible(&mut self, coord: TileCoord, vp: &Viewport, result: &mut Vec<(TileCoord, Arc<ImageView>)>) {
         let target_depth = coord.pixel_scale() <= vp.pixel_scale || coord.level >= MAX_DEPTH;
         if target_depth || self.children.iter().any(|c| !matches!(c, ChildNode::Present(_))) {
-            result.push((coord.clone(), self.item.clone()));
+            result.push((coord, self.item.clone()));
         }
         if target_depth {
             return;
@@ -326,17 +327,17 @@ impl QuadTree {
         let root_coord = TileCoord::root();
         match &mut self.root {
             ChildNode::Pending => {
-                self.root = ChildNode::Blocked;
+                self.root = ChildNode::Computing;
                 Some(root_coord)
             },
-            ChildNode::Blocked => None,
             ChildNode::Present(root) => {
                 let result = root.next_tile(root_coord, &vp.scale_pix(2.0));
                 result.map(|(coord, child)| {
-                    *child = ChildNode::Blocked;
+                    *child = ChildNode::Computing;
                     coord
                 })
             }
+            _ => None,
         }
     }
 }
