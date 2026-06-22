@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
-use std::{num::NonZero, sync::Arc};
+use std::{array, collections::HashSet, num::NonZero, sync::Arc};
+use indexmap::IndexSet;
 use vulkano::{
     device::{Device, DeviceOwned},
     format::Format,
@@ -170,20 +171,29 @@ impl TileArena {
 pub struct TilePool {
     cur_arena: Option<TileArena>,
     dev: Arc<Device>,
+    arena_count: u32,
 }
 
 impl TilePool {
     pub fn new(dev: Arc<Device>) -> Self {
-        TilePool { cur_arena: None, dev}
+        TilePool { cur_arena: None, dev, arena_count: 0 }
     }
-
-    pub fn allocate(&mut self) -> Arc<ImageView> {
-        if let Some(arena) = &mut self.cur_arena && let Some(iv) = arena.make() {
-            return iv;
+    pub fn try_allocate(&mut self) -> Option<Arc<ImageView>> {
+        if let Some(arena) = &mut self.cur_arena {
+            arena.make()
+        } else {
+            Some(self.allocate_from_new_arena())
         }
+    }
+    pub fn allocate_from_new_arena(&mut self) -> Arc<ImageView> {
         let (new_arena, iv) = TileArena::new_default(&self.dev);
         self.cur_arena = Some(new_arena);
+        self.arena_count += 1;
+        eprintln!("Allocated new arena {:?}", self.arena_count);
         iv
+    }
+    pub fn allocate(&mut self) -> Arc<ImageView> {
+        self.try_allocate().unwrap_or_else(|| self.allocate_from_new_arena())
     }
 }
 
@@ -224,25 +234,17 @@ impl QuadTreeNode {
             }
         }
     }
-    fn insert(&mut self, coord: TileCoord, tile: Option<Arc<ImageView>>, blocks: [bool; 4]) -> bool {
-        if coord.level > 1{
+    fn get_slot(&mut self, coord: TileCoord) -> Option<(usize, &mut QuadTreeNode)> {
+        if coord.level > 1 {
             let (quadrant, child_coord) = coord.child();
             match &mut self.children[quadrant] {
-                Present(child) => child.insert(child_coord, tile, blocks),
-                _ => false,
+                Present(child) => child.get_slot(child_coord),
+                _ => None,
             }
         } else {
-            let dest = &mut self.children[(coord.y * 2 + coord.x) as usize];
-            if matches!(dest, ChildNode::Present(_)) {
-                false
-            } else {
-                *dest = match tile {
-                    None => ChildNode::Pending,
-                    Some(t) => ChildNode::Present(Box::new(QuadTreeNode::new(t, blocks))),
-                };
-                true
-            }
+            Some(((coord.y * 2 + coord.x) as usize, self))
         }
+
     }
 
     fn children_iter(&mut self, coord: TileCoord, vp: &Viewport) -> impl Iterator<Item = (TileCoord, &mut ChildNode)> {
@@ -251,7 +253,7 @@ impl QuadTreeNode {
 
     fn collect_visible(&mut self, coord: TileCoord, vp: &Viewport, result: &mut Vec<(TileCoord, Arc<ImageView>)>) {
         let target_depth = coord.pixel_scale() <= vp.pixel_scale || coord.level >= MAX_DEPTH;
-        if target_depth || self.children.iter().any(|c| !matches!(c, ChildNode::Present(_))) {
+        if target_depth || self.children_iter(coord, vp).any(|(_, c)| !matches!(c, ChildNode::Present(_))) {
             result.push((coord, self.item.clone()));
         }
         if target_depth {
@@ -288,29 +290,79 @@ impl QuadTreeNode {
         result
     }
 }
+
+const LEAVES_LEVELS: usize = (MAX_DEPTH - 1) as usize;
+type Leaves = [IndexSet<(u64, u64)>; 2];
+fn new_leaves() -> Leaves {
+    array::from_fn(|_| IndexSet::new())
+}
+
 pub struct QuadTree {
     root: ChildNode,
+
+    leaves: [Leaves; LEAVES_LEVELS],
+    locked: HashSet<TileCoord>,
 }
 impl QuadTree {
     pub fn new() -> Self {
-        QuadTree { root: ChildNode::Pending }
+        QuadTree { root: ChildNode::Pending, leaves: array::from_fn(|_| new_leaves()), locked: HashSet::new() }
     }
-    pub fn insert(&mut self, coord: TileCoord, tile: Option<Arc<ImageView>>, blocks: [bool; 4]) -> bool {
-        match coord.level {
-            0 => {
-                self.root = match tile {
-                    None => ChildNode::Pending,
-                    Some(t) => ChildNode::Present(Box::new(QuadTreeNode::new(t, blocks))),
-                };
-                true
+    pub fn insert(&mut self, coord: TileCoord, tile: Arc<ImageView>, blocks: [bool; 4]) -> bool {
+        let slot = if coord.level == 0 {
+            Some(&mut self.root)
+        } else {
+            if let Present(root) = &mut self.root && let Some((quadrant, node)) = root.get_slot(coord) {
+                Some(&mut node.children[quadrant])
+            } else {
+                None
             }
-            _ => {
-                match &mut self.root {
-                    Present(root) => root.insert(coord, tile, blocks),
-                    _ => false,
+        };
+        if let Some(slot) = slot && matches!(slot, ChildNode::Computing) {
+            *slot = ChildNode::Present(Box::new(QuadTreeNode::new(tile, blocks)));
+            if coord.level > 0 {
+                self.leaves[(coord.level - 1) as usize][1].insert_full((coord.x, coord.y));
+                self.locked.insert(coord);
+                if let Some(parent) = coord.parent() && parent.level > 0 {
+                    self.leaves[(parent.level - 1) as usize].iter_mut().for_each(|arr| { arr.shift_remove(&(parent.x, parent.y)); });
                 }
             }
+            true
+        } else {
+            false
         }
+    }
+    fn find_leave(&self) -> Option<TileCoord> {
+        self.leaves.iter().enumerate().rev()
+            .find_map(|(level, items)| items.iter()
+                .find_map(|item| item.iter().map(|(x, y)| TileCoord { level: (level+1) as u32, x: *x, y: *y })
+                    .find(|coord| !self.locked.contains(coord))))
+    }
+    pub fn take_image(&mut self) -> Option<Arc<ImageView>> {
+        let coord = self.find_leave()?;
+        let (quadrant, node) = match &mut self.root {
+            ChildNode::Present(root) => root.get_slot(coord)?,
+            _ => return None,
+        };
+        let result = match std::mem::replace(&mut node.children[quadrant], ChildNode::Pending) {
+            ChildNode::Present(child) => child.item,
+            _ => return None,
+        };
+        self.leaves[(coord.level - 1) as usize].iter_mut().for_each(|leaves| { leaves.shift_remove(&(coord.x, coord.y)); });
+        if node.children.iter().all(|c| matches!(c, ChildNode::Pending) || matches!(c, ChildNode::Blocked))
+            && let Some(parent) = coord.parent() && parent.level > 0 {
+                self.leaves[(parent.level - 1) as usize][0].insert_full((parent.x, parent.y));
+            }
+        Some(result)
+    }
+    pub fn take_or_alloc(&mut self, pool : &mut TilePool) -> (Arc<ImageView>, bool) {
+        if let Some(iv) = pool.try_allocate() {
+            (iv, false)
+        } else if let Some(iv) = self.take_image() {
+            (iv, true)
+        } else {
+            (pool.allocate(), false)
+        }
+
     }
     /// Find visible tiles at the best available resolution for the given viewport.
     /// Returns list of (TileCoord, TileSlot, screen_rect) for rendering.
@@ -319,6 +371,8 @@ impl QuadTree {
         if let Present(root) = &mut self.root {
             root.collect_visible(TileCoord::root(), vp, &mut result);
         }
+        self.locked.clear();
+        self.locked.extend(result.iter().map(|(c, _)| c));
         result
     }
     /// Find next tiles that need to be computed to improve resolution for the viewport.

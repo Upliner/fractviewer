@@ -1,4 +1,4 @@
-use std::{cell::Cell, cmp::min, sync::Arc};
+use std::{cell::Cell, cmp::min, io::Write, sync::Arc};
 use vulkano::{
     Validated, VulkanError, VulkanLibrary, command_buffer::allocator::StandardCommandBufferAllocator, descriptor_set::allocator::StandardDescriptorSetAllocator, device::{
         Device, DeviceCreateInfo, DeviceExtensions, DeviceFeatures, Queue, QueueCreateInfo, QueueFamilyProperties, QueueFlags, physical::PhysicalDeviceType
@@ -52,8 +52,17 @@ impl VulkanContext {
                 enabled_extensions: required_extensions,
                 ..Default::default()
             },
-        )
-        .expect("failed to create Vulkan instance");
+        ).inspect_err(|e| {
+            if let Ok(f) = std::fs::File::create("error.txt") {
+                let mut writer = std::io::BufWriter::new(f);
+                let _ = match &e {
+                    Validated::Error(e) => writeln!(writer, "Vulkan error: {:?}", e),
+                    Validated::ValidationError(e) => writeln!(writer, "Validation error: {:?}", e),
+                };
+            } else {
+                eprintln!("failed to open error.txt");
+            }
+        }).expect("failed to create Vulkan instance");
 
         let surface = Surface::from_window(instance.clone(), window.clone())
             .expect("failed to create surface");

@@ -384,6 +384,7 @@ name = "fractviewer"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "indexmap",
  "smallvec",
  "vulkano",
  "vulkano-shaders",

@@ -1,12 +1,12 @@
-use std::sync::Arc;
+use std::{array, sync::Arc};
 use smallvec::smallvec;
-use ash::vk;
+use ash::vk::{self, PipelineStageFlags};
 use vulkano::{
-    VulkanObject, command_buffer::{CommandBufferBeginInfo, CommandBufferLevel, CommandBufferUsage, RecordingCommandBuffer}, descriptor_set::{
+    VulkanObject, command_buffer::{CommandBuffer, CommandBufferBeginInfo, CommandBufferLevel, CommandBufferUsage, RecordingCommandBuffer}, descriptor_set::{
         WriteDescriptorSet, layout::DescriptorSetLayout, sys::RawDescriptorSet
     }, device::{Device, Queue}, format::Format, image::{ImageAspect, ImageAspects, ImageCreateInfo, ImageLayout, ImageSubresourceRange, ImageTiling, ImageType, ImageUsage, sys::RawImage, view::ImageView}, memory::{DeviceMemory, MemoryAllocateInfo, MemoryMapInfo, MemoryPropertyFlags, ResourceMemory}, pipeline::{
         ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo, compute::ComputePipelineCreateInfo, layout::{PipelineDescriptorSetLayoutCreateInfo, PipelineLayoutCreateInfo}
-    }, shader::ShaderModule, sync::{AccessFlags, DependencyInfo, ImageMemoryBarrier, PipelineStages, QueueFamilyOwnershipTransfer, fence::{Fence, FenceCreateInfo}}
+    }, shader::ShaderModule, sync::{AccessFlags, DependencyInfo, ImageMemoryBarrier, PipelineStages, QueueFamilyOwnershipTransfer, fence::{Fence, FenceCreateInfo}, semaphore::Semaphore}
 };
 
 use crate::context::VulkanData;
@@ -60,7 +60,7 @@ mod tilemap_shader {
 
 layout(local_size_x = 2, local_size_y = 2) in;
 
-layout(set = 0, binding = 0, r16) uniform image2D in_tile;
+layout(set = 0, binding = 0, r16) uniform readonly image2D in_tile;
 layout(set = 1, binding = 0, r32ui) uniform writeonly uimage2D map;
 
 layout(push_constant) uniform PushConstants {
@@ -91,12 +91,14 @@ struct MyPipeline {
 pub struct ComputeEngine {
     pub max_iterations: u32,
     vk: Arc<VulkanData>,
+    q: Arc<Queue>,
     _iv: Arc<ImageView>,
     map_mem: *const u32,
     row_pitch: usize,
     tile_compute: MyPipeline,
     map_compute: MyPipeline,
     bar_map_in: ImageMemoryBarrier,
+    semaphores: Option<[Semaphore; 2]>,
     fence: Fence,
 }
 
@@ -116,7 +118,7 @@ fn find_memory_type(dev: &Device, memory_type_bits : u32) -> Option<u32> {
 }
 
 impl ComputeEngine {
-    pub fn new(vk: Arc<VulkanData>, max_iterations: u32) -> Self {
+    pub fn new(vk: Arc<VulkanData>, q: Arc<Queue>, max_iterations: u32) -> Self {
         let dev = vk.device.clone();
         let make_pipeline = |shader: Arc<ShaderModule>, mut set_layouts: Vec<Arc<DescriptorSetLayout>>| {
             let entry = shader.entry_point("main").unwrap();
@@ -188,16 +190,21 @@ impl ComputeEngine {
                 subresource_range: ImageSubresourceRange{aspects: ImageAspects::COLOR, mip_levels: 0..1, array_layers: 0..1},
                 ..ImageMemoryBarrier::image(map_img.image().clone())
             },
-            max_iterations, vk, map_mem, tile_compute, map_compute, _iv: map_img, row_pitch: (row_pitch/4) as usize,
+            semaphores: if q.queue_family_index() == vk.graphics_queue.queue_family_index() {
+                None
+            } else {
+                Some(array::from_fn(|_| Semaphore::from_pool(dev.clone()).unwrap()))
+            },
+            max_iterations, q, vk, map_mem, tile_compute, map_compute, _iv: map_img, row_pitch: (row_pitch/4) as usize,
         }
     }
 
     /// Record compute dispatches for the given tile coords into a command buffer.
     pub fn compute_tile(
         &mut self,
-        q: &Arc<Queue>,
         iv: Arc<ImageView>,
         coord: TileCoord,
+        need_aquire: bool,
     ) -> [bool; 4] {
         let (ox, oy) = coord.origin();
         let push_tile = mandelbrot_shader::PushConstants {
@@ -211,27 +218,83 @@ impl ComputeEngine {
             size: (TILE_SIZE / 2) as i32,
         };
 
-        let qfi = q.queue_family_index();
+        let qfi = self.q.queue_family_index();
+        let gqfi: u32 = self.vk.graphics_queue.queue_family_index();
 
-        let mut builder = RecordingCommandBuffer::new(
-            self.vk.command_buffer_allocator.clone(), qfi,
-            CommandBufferLevel::Primary,
-            CommandBufferBeginInfo {
-                usage: CommandBufferUsage::OneTimeSubmit,
-                ..Default::default()
-            },
-        ).unwrap();
         let srr = ImageSubresourceRange{aspects: ImageAspects::COLOR, mip_levels: 0..1, array_layers: 0..1};
-        let bar1 = ImageMemoryBarrier {
-            src_stages: PipelineStages::TOP_OF_PIPE,
-            dst_stages: PipelineStages::COMPUTE_SHADER,
-            src_access: AccessFlags::empty(),
-            dst_access: AccessFlags::SHADER_WRITE,
-            old_layout: ImageLayout::Undefined,
-            new_layout: ImageLayout::General,
-            subresource_range: srr.clone(),
-            ..ImageMemoryBarrier::image(iv.image().clone())
+        let bar1 = if !need_aquire || qfi != gqfi {
+            ImageMemoryBarrier {
+                src_stages: PipelineStages::TOP_OF_PIPE,
+                dst_stages: PipelineStages::COMPUTE_SHADER,
+                src_access: AccessFlags::empty(),
+                dst_access: AccessFlags::SHADER_WRITE,
+                old_layout: ImageLayout::Undefined,
+                new_layout: ImageLayout::General,
+                queue_family_ownership_transfer: if need_aquire {
+                    Some(QueueFamilyOwnershipTransfer::ExclusiveBetweenLocal {
+                        src_index: gqfi, dst_index: qfi})
+                } else {
+                    None
+                },
+                subresource_range: srr.clone(),
+                ..ImageMemoryBarrier::image(iv.image().clone())
+            }
+        } else {
+            ImageMemoryBarrier {
+                src_stages: PipelineStages::FRAGMENT_SHADER,
+                dst_stages: PipelineStages::COMPUTE_SHADER,
+                src_access: AccessFlags::SHADER_READ,
+                dst_access: AccessFlags::SHADER_WRITE,
+                old_layout: ImageLayout::Undefined,
+                new_layout: ImageLayout::General,
+                subresource_range: srr.clone(),
+                ..ImageMemoryBarrier::image(iv.image().clone())
+            }
         };
+        let mut submit_info = vk::SubmitInfo::default();
+        let mut rel_semaphore = Option::<([ash::vk::Semaphore; 1], [PipelineStageFlags; 1])>::None;
+        let mut rel_cb = Option::<CommandBuffer>::None;
+        if need_aquire && let Some(semaphores) = &self.semaphores {
+            let semaphore = rel_semaphore
+                .insert(([semaphores[0].handle()], [PipelineStageFlags::COMPUTE_SHADER]));
+            submit_info = submit_info.wait_semaphores(&semaphore.0).wait_dst_stage_mask(&semaphore.1);
+            let mut builder = RecordingCommandBuffer::new(
+                self.vk.command_buffer_allocator.clone(),
+                gqfi,
+                CommandBufferLevel::Primary,
+                CommandBufferBeginInfo {
+                    usage: CommandBufferUsage::OneTimeSubmit,
+                    ..Default::default()
+                },
+            ).unwrap();
+            let bar = ImageMemoryBarrier {
+                src_stages: PipelineStages::FRAGMENT_SHADER,
+                dst_stages: PipelineStages::BOTTOM_OF_PIPE,
+                src_access: AccessFlags::SHADER_READ,
+                dst_access: AccessFlags::empty(),
+                old_layout: ImageLayout::Undefined,
+                new_layout: ImageLayout::General,
+                subresource_range: srr.clone(),
+                queue_family_ownership_transfer: Some(QueueFamilyOwnershipTransfer::ExclusiveBetweenLocal {
+                    src_index: gqfi, dst_index: qfi}),
+                ..ImageMemoryBarrier::image(iv.image().clone())
+            };
+            let cb = rel_cb.insert(unsafe {
+                builder
+                .pipeline_barrier(&DependencyInfo{image_memory_barriers: smallvec![bar],..Default::default()})
+                .unwrap();
+                builder.end()
+            }.expect("failed to build queue transfer command buffer"));
+            let cb_arr = [cb.handle()];
+            let rel_submit_info = vk::SubmitInfo::default().command_buffers(&cb_arr).signal_semaphores(&semaphore.0);
+            self.vk.graphics_queue.with(|_| unsafe {
+                let result = (self.vk.device.fns().v1_0.queue_submit)(self.vk.graphics_queue.handle(), 1, &rel_submit_info, ash::vk::Fence::null());
+                if result != vk::Result::SUCCESS {
+                    panic!("failed to submit queue transfer command buffer");
+                }
+            });
+
+        }
         let bar_tile_make_map = ImageMemoryBarrier {
             src_stages: PipelineStages::COMPUTE_SHADER,
             dst_stages: PipelineStages::COMPUTE_SHADER,
@@ -252,16 +315,14 @@ impl ComputeEngine {
             subresource_range: srr.clone(),
             ..ImageMemoryBarrier::image(iv.image().clone())
         };
-        let gqfi = self.vk.graphics_queue.queue_family_index();
-        let queue_transfer = qfi != gqfi;
-        let bar_tile_out = if queue_transfer {
+        let bar_tile_out = if qfi != gqfi {
             ImageMemoryBarrier {
                 src_stages: PipelineStages::COMPUTE_SHADER,
                 dst_stages: PipelineStages::BOTTOM_OF_PIPE,
                 src_access: AccessFlags::SHADER_READ,
                 dst_access: AccessFlags::empty(),
                 old_layout: ImageLayout::General,
-                new_layout: ImageLayout::ShaderReadOnlyOptimal,
+                new_layout: ImageLayout::General,
                 queue_family_ownership_transfer: Some(QueueFamilyOwnershipTransfer::ExclusiveBetweenLocal {
                     src_index: qfi, dst_index: gqfi}),
                 subresource_range: srr.clone(),
@@ -274,11 +335,21 @@ impl ComputeEngine {
                 src_access: AccessFlags::SHADER_WRITE,
                 dst_access: AccessFlags::SHADER_READ,
                 old_layout: ImageLayout::General,
-                new_layout: ImageLayout::ShaderReadOnlyOptimal,
+                new_layout: ImageLayout::General,
                 subresource_range: srr.clone(),
                 ..ImageMemoryBarrier::image(iv.image().clone())
             }
         };
+
+        let mut builder = RecordingCommandBuffer::new(
+            self.vk.command_buffer_allocator.clone(), qfi,
+            CommandBufferLevel::Primary,
+            CommandBufferBeginInfo {
+                usage: CommandBufferUsage::OneTimeSubmit,
+                ..Default::default()
+            },
+        ).unwrap();
+
         let tile_layout = self.tile_compute.pipeline.layout().as_ref();
         let map_layout = self.map_compute.pipeline.layout().as_ref();
         let cb = unsafe {
@@ -314,18 +385,21 @@ impl ComputeEngine {
             builder.end()
         }.expect("failed to build compute command buffer");
         let cb_arr = [cb.handle()];
-        let submit_info = vk::SubmitInfo::default().command_buffers(&cb_arr);
-        q.with(|_| unsafe {
-            let result = (self.vk.device.fns().v1_0.queue_submit)(q.handle(), 1, &submit_info, self.fence.handle());
+        submit_info = submit_info.command_buffers(&cb_arr);
+        let mut fence = self.fence.handle();
+        let mut aq_semaphore = Option::<[ash::vk::Semaphore; 1]>::None;
+        if let Some(semaphores) = &self.semaphores {
+            submit_info = submit_info.signal_semaphores(aq_semaphore.insert([semaphores[1].handle()]));
+            fence = ash::vk::Fence::null();
+        }
+        self.q.with(|_| unsafe {
+            let result = (self.vk.device.fns().v1_0.queue_submit)(self.q.handle(), 1, &submit_info, fence);
             if result != vk::Result::SUCCESS {
                 panic!("failed to submit compute command buffer");
             }
         });
-        self.fence.wait(None).expect("Vulkan fence wait failed");
-        unsafe {
-            self.fence.reset().expect("Vulkan fence reset failed");
-        }
-        if queue_transfer {
+        let mut aq_cb = Option::<CommandBuffer>::None;
+        if let Some(semaphores) = &self.semaphores {
             let mut builder = RecordingCommandBuffer::new(
                 self.vk.command_buffer_allocator.clone(),
                 gqfi,
@@ -341,20 +415,23 @@ impl ComputeEngine {
                 src_access: AccessFlags::empty(),
                 dst_access: AccessFlags::SHADER_READ,
                 old_layout: ImageLayout::General,
-                new_layout: ImageLayout::ShaderReadOnlyOptimal,
+                new_layout: ImageLayout::General,
                 queue_family_ownership_transfer: Some(QueueFamilyOwnershipTransfer::ExclusiveBetweenLocal {
                     src_index: qfi, dst_index: gqfi}),
                 subresource_range: ImageSubresourceRange{aspects: ImageAspects::COLOR, mip_levels: 0..1, array_layers: 0..1},
                 ..ImageMemoryBarrier::image(iv.image().clone())
             };
-            let cb = unsafe {
+            let cb = aq_cb.insert(unsafe {
                 builder
                 .pipeline_barrier(&DependencyInfo{image_memory_barriers: smallvec![bar],..Default::default()})
                 .unwrap();
                 builder.end()
-            }.expect("failed to build queue transfer command buffer");
+            }.expect("failed to build queue transfer command buffer"));
             let cb_arr = [cb.handle()];
-            let submit_info = vk::SubmitInfo::default().command_buffers(&cb_arr);
+            let semaphores = [semaphores[1].handle()];
+            let dst_stage_mask = [PipelineStageFlags::FRAGMENT_SHADER];
+            let submit_info = vk::SubmitInfo::default().command_buffers(&cb_arr)
+                .wait_semaphores(&semaphores).wait_dst_stage_mask(&dst_stage_mask);
             self.vk.graphics_queue.with(|_| unsafe {
                 let result = (self.vk.device.fns().v1_0.queue_submit)(self.vk.graphics_queue.handle(), 1, &submit_info, self.fence.handle());
                 if result != vk::Result::SUCCESS {
@@ -362,17 +439,14 @@ impl ComputeEngine {
                 }
             });
         }
+        self.fence.wait(None).expect("Vulkan fence wait failed");
+        unsafe {
+            self.fence.reset().expect("Vulkan fence reset failed");
+        }
         self.bar_map_in.src_stages = PipelineStages::HOST;
         self.bar_map_in.src_access = AccessFlags::HOST_READ;
-        self.bar_map_in.old_layout = ImageLayout::General;
         let row1 = unsafe { std::ptr::read_volatile(self.map_mem as *const [u32;2]) };
         let row2= unsafe { std::ptr::read_volatile(self.map_mem.add(self.row_pitch) as *const [u32;2]) };
-        if queue_transfer {
-            self.fence.wait(None).expect("Vulkan fence wait failed");
-            unsafe {
-                self.fence.reset().expect("Vulkan fence reset failed");
-            }
-        }
         [row1[0] > 0, row1[1] > 0, row2[0] > 0, row2[1] > 0]
     }
 }

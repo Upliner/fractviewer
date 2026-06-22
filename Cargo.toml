@@ -5,7 +5,8 @@ edition = "2024"
 
 [dependencies]
 ash = "0.38.0"
-smallvec = "1.15.2"
+indexmap = "2.14"
+smallvec = "1.15"
 vulkano = "0.35"
 vulkano-shaders = "0.35"
 winit = "0.30"
