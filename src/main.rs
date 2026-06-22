@@ -120,13 +120,9 @@ fn worker_func(data: Arc<SharedData>, q: Arc<Queue>, id: usize) {
         let mut quadtree = data.quadtree.lock().unwrap();
         let tile_coord = quadtree.next_tile(data.camera.lock().unwrap().viewport(w, h));
         if let Some(tile_coord) = tile_coord {
-            let (tile, need_aquire) = quadtree.take_or_alloc(&mut data.pool.lock().unwrap());
+            let tile = quadtree.take_or_alloc(&mut data.pool.lock().unwrap());
             drop(quadtree);
-            let blocks = compute.compute_tile(
-                tile.clone(),
-                tile_coord,
-                need_aquire,
-            );
+            let blocks = compute.compute_tile(tile.clone(), tile_coord);
             blocks.iter().for_each(|block| if *block { sc.cull_count += 1; });
             if !data.quadtree.lock().unwrap().insert(tile_coord, tile, blocks) {
                 eprintln!("Failed to insert tile to location {:?}", tile_coord);
@@ -319,20 +315,6 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
-    /*std::panic::set_hook(Box::new(|panic_info| {
-        if let Ok(f) = std::fs::File::create("panic.txt") {
-            let mut writer = std::io::BufWriter::new(f);
-            let _ = writeln!(writer, "Panic occurred");
-            if let Some(location) = panic_info.location() {
-                let _ = writeln!(writer, "Panic location: file '{}', line {}", location.file(), location.line());
-            }
-            if let Some(message) = panic_info.payload().downcast_ref::<&str>() {
-                let _ = writeln!(writer, "Error message: {}", message);
-            }
-        } else {
-            eprintln!("failed to open panic.txt");
-        }
-    }));*/
     let event_loop = EventLoop::new().expect("Error creating event loop");
     event_loop.set_control_flow(ControlFlow::Wait); // Use WaitUntil 5ms ?
     let mut app = App::new();
