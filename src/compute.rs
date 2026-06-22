@@ -1,4 +1,4 @@
-use std::{array, sync::Arc};
+use std::sync::Arc;
 use smallvec::smallvec;
 use ash::vk::{self, PipelineStageFlags};
 use vulkano::{
@@ -98,7 +98,7 @@ pub struct ComputeEngine {
     tile_compute: MyPipeline,
     map_compute: MyPipeline,
     bar_map_in: ImageMemoryBarrier,
-    semaphores: Option<[Semaphore; 2]>,
+    semaphore: Option<Semaphore>,
     fence: Fence,
 }
 
@@ -190,10 +190,10 @@ impl ComputeEngine {
                 subresource_range: ImageSubresourceRange{aspects: ImageAspects::COLOR, mip_levels: 0..1, array_layers: 0..1},
                 ..ImageMemoryBarrier::image(map_img.image().clone())
             },
-            semaphores: if q.queue_family_index() == vk.graphics_queue.queue_family_index() {
+            semaphore: if q.queue_family_index() == vk.graphics_queue.queue_family_index() {
                 None
             } else {
-                Some(array::from_fn(|_| Semaphore::from_pool(dev.clone()).unwrap()))
+                Some(Semaphore::from_pool(dev.clone()).unwrap())
             },
             max_iterations, q, vk, map_mem, tile_compute, map_compute, _iv: map_img, row_pitch: (row_pitch/4) as usize,
         }
@@ -325,8 +325,8 @@ impl ComputeEngine {
         submit_info = submit_info.command_buffers(&cb_arr);
         let mut fence = self.fence.handle();
         let mut aq_semaphore = Option::<[ash::vk::Semaphore; 1]>::None;
-        if let Some(semaphores) = &self.semaphores {
-            submit_info = submit_info.signal_semaphores(aq_semaphore.insert([semaphores[1].handle()]));
+        if let Some(semaphore) = &self.semaphore {
+            submit_info = submit_info.signal_semaphores(aq_semaphore.insert([semaphore.handle()]));
             fence = ash::vk::Fence::null();
         }
         self.q.with(|_| unsafe {
@@ -336,7 +336,7 @@ impl ComputeEngine {
             }
         });
         let mut aq_cb = Option::<CommandBuffer>::None;
-        if let Some(semaphores) = &self.semaphores {
+        if let Some(semaphore) = &self.semaphore {
             let mut builder = RecordingCommandBuffer::new(
                 self.vk.command_buffer_allocator.clone(),
                 gqfi,
@@ -365,7 +365,7 @@ impl ComputeEngine {
                 builder.end()
             }.expect("failed to build queue transfer command buffer"));
             let cb_arr = [cb.handle()];
-            let semaphores = [semaphores[1].handle()];
+            let semaphores = [semaphore.handle()];
             let dst_stage_mask = [PipelineStageFlags::FRAGMENT_SHADER];
             let submit_info = vk::SubmitInfo::default().command_buffers(&cb_arr)
                 .wait_semaphores(&semaphores).wait_dst_stage_mask(&dst_stage_mask);
