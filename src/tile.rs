@@ -1,12 +1,10 @@
 #![allow(dead_code)]
 
 use std::{array, collections::HashSet, num::NonZero, sync::Arc};
+use ash::vk::MAX_MEMORY_HEAPS;
 use indexmap::IndexSet;
 use vulkano::{
-    device::{Device, DeviceOwned},
-    format::Format,
-    image::{ImageCreateInfo, ImageType, ImageUsage, sys::RawImage, view::ImageView},
-    memory::{DeviceMemory, MemoryAllocateInfo, MemoryPropertyFlags, ResourceMemory, allocator::align_up},
+    VulkanObject, device::{Device, DeviceOwned, physical::PhysicalDevice}, format::Format, image::{ImageCreateInfo, ImageType, ImageUsage, sys::RawImage, view::ImageView}, memory::{DeviceMemory, MemoryAllocateInfo, MemoryPropertyFlags, ResourceMemory, allocator::align_up},
 };
 
 use crate::{camera::Viewport, tile::ChildNode::Present};
@@ -168,6 +166,34 @@ impl TileArena {
     }
 }
 
+fn get_memory_properties2(
+    dev: &PhysicalDevice,
+) -> (ash::vk::PhysicalDeviceMemoryBudgetPropertiesEXT<'_>, usize) {
+    let instance = dev.instance().as_ref();
+    let mut budget = ash::vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+    let mut props = ash::vk::PhysicalDeviceMemoryProperties2KHR::default().push_next(&mut budget);
+
+    let func = if instance.api_version() >= vulkano::Version::V1_1 {
+        instance.fns().v1_1.get_physical_device_memory_properties2
+    } else {
+        instance.fns().khr_get_physical_device_properties2.get_physical_device_memory_properties2_khr
+    };
+    unsafe { (func)(dev.handle(), &mut props) };
+    let mut cnt = props.memory_properties.memory_heap_count as usize;
+    if cnt > MAX_MEMORY_HEAPS {
+        cnt = 0;
+    }
+    (budget, cnt)
+}
+fn should_allocate(dev: &PhysicalDevice, heap_index: usize) -> bool {
+    let (mem_props, cnt) = get_memory_properties2(dev);
+    if heap_index >= cnt {
+        return false;
+    }
+    let usage = mem_props.heap_usage[heap_index];
+    usage > 0 && mem_props.heap_budget[heap_index] > usage * 2
+}
+
 pub struct TilePool {
     cur_arena: Option<TileArena>,
     dev: Arc<Device>,
@@ -183,6 +209,18 @@ impl TilePool {
             arena.make()
         } else {
             Some(self.allocate_from_new_arena())
+        }
+    }
+    pub fn try_allocate_smart(&mut self) -> Option<Arc<ImageView>> {
+        if let iv = self.try_allocate() && iv.is_some() {
+            return iv;
+        }
+        let mem_props = self.dev.physical_device().memory_properties();
+        if should_allocate(self.dev.physical_device(),
+                mem_props.memory_types[self.cur_arena.as_ref().unwrap().dm.memory_type_index() as usize].heap_index as usize) {
+            Some(self.allocate_from_new_arena())
+        } else {
+            None
         }
     }
     pub fn allocate_from_new_arena(&mut self) -> Arc<ImageView> {
@@ -268,7 +306,7 @@ impl QuadTreeNode {
 
     fn next_tile(&mut self, coord: TileCoord, vp: &Viewport) -> Option<(TileCoord, &mut ChildNode)> {
         let mut result: Option<(TileCoord, &mut ChildNode)> = None;
-        let mut go_deeper = coord.level < MAX_DEPTH && coord.pixel_scale() > vp.pixel_scale;
+        let mut go_deeper = coord.level < MAX_DEPTH-1 && coord.pixel_scale() > vp.pixel_scale;
         for (child_coord, child) in self.children_iter(coord, vp) {
             match child {
                 ChildNode::Pending => return Some((child_coord, child)),
@@ -291,7 +329,7 @@ impl QuadTreeNode {
     }
 }
 
-const LEAVES_LEVELS: usize = (MAX_DEPTH - 1) as usize;
+const LEAVES_LEVELS: usize = MAX_DEPTH as usize;
 type Leaves = [IndexSet<(u64, u64)>; 2];
 fn new_leaves() -> Leaves {
     array::from_fn(|_| IndexSet::new())
@@ -354,13 +392,13 @@ impl QuadTree {
             }
         Some(result)
     }
-    pub fn take_or_alloc(&mut self, pool : &mut TilePool) -> (Arc<ImageView>, bool) {
-        if let Some(iv) = pool.try_allocate() {
-            (iv, false)
+    pub fn take_or_alloc(&mut self, pool : &mut TilePool) -> Arc<ImageView> {
+        if let Some(iv) = pool.try_allocate_smart() {
+            iv
         } else if let Some(iv) = self.take_image() {
-            (iv, true)
+            iv
         } else {
-            (pool.allocate(), false)
+            pool.allocate()
         }
 
     }
